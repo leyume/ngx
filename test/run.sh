@@ -60,7 +60,7 @@ r sh -c 'head -c 5000000 /dev/zero > /tmp/big'
 
 # live reload: ngx.env changes apply within seconds; a bad one is reported and the old config keeps serving
 sha() { sha256sum run/ngx/ngx.env | cut -d' ' -f1; }
-wait_status() { for i in $(seq 20); do grep -q "^$(sha) " run/ngx/ngx.status 2>/dev/null && break; sleep 1; done; cat run/ngx/ngx.status; }
+wait_status() { for i in $(seq 60); do grep -q "^$(sha) " run/ngx/ngx.status 2>/dev/null && break; sleep 1; done; cat run/ngx/ngx.status; }
 echo "SITES='new.test=app:80'" > run/ngx/ngx.env
 wait_status | grep -q ' ok$';                                                  ok "reload reported"
 get new.test / | grep -q '^Hostname:';                                         ok "new site live"
@@ -68,4 +68,39 @@ if get site.example / >/dev/null 2>&1; then exit 1; fi;                       ok
 echo "SITES='new.test=app:80 bad=entry=x'" > run/ngx/ngx.env
 wait_status | grep -q ' error: .*bad SITES entry';                             ok "bad config reported"
 get new.test / | grep -q '^Hostname:';                                         ok "previous config still served"
+
+# --- resilience ---------------------------------------------------------------
+# a DNS provider outage leaves out only the wildcard site that needs it; the rest of the change applies
+docker compose stop challtestsrv >/dev/null 2>&1
+echo "SITES='new.test=app:80 other.test=app2:80 down.example,*.down.example=app:80'" > run/ngx/ngx.env
+st=$(wait_status)
+echo "$st" | head -1 | grep -q ' ok$' && echo "$st" | grep -q 'down.example failed; site left out'; ok "dns outage: warning, only that site left out"
+get other.test / | grep -q "Hostname: $app2";                                  ok "rest of the change applied"
+docker compose start challtestsrv >/dev/null 2>&1
+
+# the watcher dies -> the healthcheck brings it back, and it catches up on what it missed
+r pkill -f '40-sites.sh --watch'
+echo "SITES='new.test=app2:80'" > run/ngx/ngx.env
+sleep 3; if grep -q "^$(sha) " run/ngx/ngx.status; then exit 1; fi             # nothing applies while it's dead
+r /docker-entrypoint.d/40-sites.sh --health | grep -q 'restarted';             ok "health restarts a dead watcher"
+wait_status | grep -q ' ok$' && get new.test / | grep -q "Hostname: $app2";    ok "revived watcher caught up"
+
+# boot with a broken ngx.env: nginx still starts, on the last config that worked
+echo "SITES='new.test=app:80 bad=entry=x'" > run/ngx/ngx.env
+docker compose restart web >/dev/null 2>&1
+up() { for i in $(seq 30); do r /docker-entrypoint.d/40-sites.sh --health >/dev/null 2>&1 && return; sleep 1; done; return 1; }
+up;                                                                            ok "broken config at boot: nginx up"
+get new.test / | grep -q "Hostname: $app2";                                    ok "  ...serving the last config that worked"
+wait_status | grep -q ' error: .*bad SITES entry';                             ok "  ...and the error is reported"
+# no good config to fall back to either: nginx starts with no sites, and the next fix applies
+r rm -f /var/cache/nginx/acme/last-good.conf /etc/nginx/conf.d/sites.conf
+docker compose restart web >/dev/null 2>&1
+up;                                                                            ok "broken config, nothing to fall back to: nginx up"
+echo "SITES='new.test=app:80'" > run/ngx/ngx.env
+wait_status | grep -q ' ok$' && get new.test / | grep -q '^Hostname:';         ok "  ...and a fixed config applies"
+# a backend that never answers fails in ~5s (nginx's default would hang for 60s)
+echo "SITES='new.test=app:80 dead.test=10.255.255.1:80'" > run/ngx/ngx.env
+wait_status | grep -q ' ok$'
+t=$(r curl -sk -o /dev/null -w '%{http_code} %{time_total}' --max-time 30 --resolve dead.test:443:127.0.0.1 https://dead.test/)
+case $t in 50[24]\ [0-7].*) ;; *) echo "dead backend took: $t"; exit 1 ;; esac;  ok "dead backend fails fast ($t s)"
 echo PASS

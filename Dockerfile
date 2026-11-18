@@ -17,3 +17,5 @@ COPY 40-sites.sh /docker-entrypoint.d/
 ENV NGINX_ENTRYPOINT_LOCAL_RESOLVERS=1
 VOLUME /var/cache/nginx/acme
 EXPOSE 80 443 443/udp
+# unhealthy when nginx is down or not answering; also restarts the config watcher if it ever died
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5m CMD ["/docker-entrypoint.d/40-sites.sh", "--health"]

@@ -49,7 +49,7 @@ Or use `compose.yml`.
 
 `app.example.com/api*=api:8080` sends only that path prefix (or, without `*`, that exact path) to another proxy target; `app.example.com` needs its own entry too.
 
-**Live reload.** Edit `/etc/ngx/ngx.env` (mount the directory, not the file, and read-write): within a second the config is regenerated, checked with `nginx -t` and hot-reloaded. A rejected change leaves the running config in place. Either way `ngx.status` next to it gets `<sha256 of ngx.env> ok` or `... error: <why>`, so a program writing ngx.env can tell when its change is live.
+**Live reload.** Edit `/etc/ngx/ngx.env` (mount the directory, not the file, and read-write): within a second the config is regenerated, checked with `nginx -t` and hot-reloaded. A rejected change leaves the running config in place. Programs should write it atomically (a temp file, then rename); ngx also waits for the file to stop changing, so a half-saved file is never applied. Either way `ngx.status` next to it gets `<sha256 of ngx.env> ok` or `... error: <why>`, so a program writing ngx.env can tell when its change is live.
 
 **Local domains.** `localhost`, `*.localhost`, `.test`, `.local`, `.internal`, `.home.arpa`, and anything listed in `TLS_INTERNAL`, get certificates from a local CA: offline, no DNS, wildcards included. The CA is generated once at `/var/cache/nginx/acme/local/ca.crt` (trust it to remove browser warnings), or bring one your machines already trust with `LOCAL_CA_CERT` / `LOCAL_CA_KEY` (Caddy's root works: `~/Library/Application Support/Caddy/pki/authorities/local/root.{crt,key}`).
 

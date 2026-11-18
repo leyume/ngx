@@ -122,6 +122,8 @@ install_native() {
     cat > /etc/systemd/system/nginx.service.d/ngx.conf <<'EOF'
 [Service]
 Environment=NGX_RENEW_LOOP=0
+Restart=on-failure
+RestartSec=2s
 ExecStartPre=/usr/local/lib/ngx/40-sites.sh
 ExecStartPre=/usr/sbin/nginx -t -q
 ExecReload=

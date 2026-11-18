@@ -19,53 +19,107 @@
 # HTTPS_REDIRECT=off also serves sites on :80; HTTPS_PORT=8443 points the :80 redirect at that port.
 # No SITES = no generated config; drop your own files in /etc/nginx/conf.d or /etc/nginx/templates instead.
 #
-# Modes: (none)   generate the config; at container boot also starts --watch
-#        --apply  generate, nginx -t, hot reload; on failure the running config is kept
-#        --watch  --apply whenever ngx.env changes (checked every second), plus a 12h renewal pass
+# Modes: (none)     boot: build the config; if that fails, fall back to the last one that worked (or none),
+#                    so nginx always starts. In a container, also starts --watch.
+#        --apply    build, nginx -t, hot reload; on failure the running config is kept
+#        --watch    --apply whenever ngx.env changes (checked every second), a 12h renewal pass,
+#                   and a retry every 5 min while the last apply failed or had warnings
+#        --health   container healthcheck: nginx alive and answering; restarts the watcher if it died
+#        --generate internal: write the config from ngx.env, nothing else
 # Every apply writes "<sha256 of ngx.env> ok" or "... error: <why>" to $NGX_STATUS (/etc/ngx/ngx.status),
-# so whatever wrote ngx.env can tell when and whether it took effect.
+# followed by one line per warning, so whatever wrote ngx.env can tell when and whether it took effect.
 set -eu
 env_file=/etc/ngx/ngx.env
 out=/etc/nginx/conf.d/sites.conf
 state=/var/cache/nginx/acme
+good=$state/last-good.conf  # on the state volume, so it survives the container being recreated
 status=${NGX_STATUS:-/etc/ngx/ngx.status}
+pidfile=/run/nginx.pid
 
 envsum() { sha256sum "$env_file" 2>/dev/null | cut -d' ' -f1; }
-report() { (umask 022; echo "$1" > "$status.tmp" && mv "$status.tmp" "$status") 2>/dev/null || true; }
+report() { (umask 022; printf '%s\n' "$@" | sed '/^$/d' > "$status.tmp" && mv "$status.tmp" "$status") 2>/dev/null || true; }
 acmesh() { /opt/acme.sh/acme.sh --home /opt/acme.sh --config-home "$state/dns" "$@"; }
+nginx_up() { [ -f "$pidfile" ] && kill -0 "$(cat "$pidfile")" 2>/dev/null; }
+
+# Returns 0 = applied, 3 = applied with warnings, 1 = rejected (previous config kept).
+apply() {  # $1: reload | boot
+    # Read ngx.env once: the checksum we report and the config we build come from the same bytes,
+    # even if the file changes (or is caught half-written) while we work.
+    snap=$(mktemp)
+    if [ -f "$env_file" ]; then cat "$env_file" > "$snap"; sum=$(sha256sum < "$snap" | cut -d' ' -f1); else sum=; fi
+    cp -p "$out" "$out.prev" 2>/dev/null || rm -f "$out.prev"
+    if log=$(NGX_ENV_SNAPSHOT=$snap "$0" --generate 2>&1 && nginx -t 2>&1 && { [ "$1" = boot ] || nginx -s reload 2>&1; }); then
+        rm -f "$snap"
+        rm -f "$out.prev"
+        if [ -f "$out" ]; then cp -p "$out" "$good"; else rm -f "$good"; fi
+        warn=$(echo "$log" | sed -n 's/^40-sites.sh: warning: //p')
+        report "$sum ok" "$warn"
+        echo "$log" | grep '^40-sites.sh' || :
+        [ -z "$warn" ] || return 3
+        return 0
+    fi
+    rm -f "$snap"
+    why=$(echo "$log" | grep -v -e '^40-sites.sh: wrote' -e 'syntax is ok$' -e 'is successful$' | tr '\n' ' ')
+    if [ -f "$out.prev" ]; then mv "$out.prev" "$out"
+    elif [ -f "$good" ]; then cp -p "$good" "$out"; fi  # boot: the last config that worked
+    # never leave nginx unable to start: an unusable fallback is dropped, nginx then serves no sites
+    [ "$1" != boot ] || nginx -t >/dev/null 2>&1 || rm -f "$out"
+    report "$sum error: $why"
+    echo "40-sites.sh: not applied, serving the previous config: $why" >&2
+    return 1
+}
 
 case ${1:-} in
 --apply)
-    sum=$(envsum)
-    cp -p "$out" "$out.prev" 2>/dev/null || rm -f "$out.prev"
-    if msg=$(NGX_RENEW_LOOP=0 "$0" 2>&1 && nginx -t 2>&1 && nginx -s reload 2>&1); then
-        rm -f "$out.prev"; report "$sum ok"; echo "40-sites.sh: applied"; exit 0
-    fi
-    if [ -f "$out.prev" ]; then mv "$out.prev" "$out"; else rm -f "$out"; fi
-    msg=$(echo "$msg" | grep -v -e '^40-sites.sh: wrote' -e 'syntax is ok$' | tr '\n' ' ')
-    report "$sum error: $msg"
-    echo "40-sites.sh: not applied, still serving the previous config: $msg" >&2
-    exit 1 ;;
+    # one apply at a time (native: the path unit and `systemctl reload` can overlap)
+    exec 9>"${TMPDIR:-/tmp}/ngx-apply.lock"
+    if command -v flock >/dev/null; then flock 9; fi
+    rc=0; apply reload || rc=$?
+    exit $rc ;;
 --watch)
     # ponytail: 1s polling instead of inotify (not in the base image); sha256 of a few KB is free
-    last=$(envsum); t=0
+    last=${2:-}  # the ngx.env checksum boot built from ("" = apply once right away)
+    until nginx_up; do sleep 1; done  # a reload before nginx runs would fail and lose the change
+    t=0 period=43200
     while sleep 1; do
         t=$((t + 1)); s=$(envsum)
-        [ "$s" != "$last" ] || [ $t -ge 43200 ] || continue
+        [ "$s" != "$last" ] || [ $t -ge $period ] || continue
+        # a file still being written reads differently a moment later: wait until it holds still
+        sleep 0.3; [ "$(envsum)" = "$s" ] || continue
         [ $t -lt 43200 ] || [ ! -d "$state/dns" ] || acmesh --cron >/dev/null || :  # wildcard renewals
         last=$s; t=0
-        "$0" --apply || :  # also renews local certificates nearing expiry
+        rc=0; "$0" --apply || rc=$?  # also renews local certificates nearing expiry
+        period=43200; [ $rc = 0 ] || period=300  # retry failures and warnings every 5 min
     done ;;
-"") ;;
-*) echo "usage: 40-sites.sh [--apply|--watch]" >&2; exit 2 ;;
+--health)
+    nginx_up || { echo "nginx is not running"; exit 1; }
+    # with no sites (none configured yet, or a broken first config) nothing listens, and that's fine
+    [ ! -f "$out" ] || curl -s -o /dev/null --max-time 5 http://127.0.0.1/ || { echo "nginx is not answering on :80"; exit 1; }
+    if [ "${NGX_RENEW_LOOP:-1}" = 1 ] && ! pgrep -f '40-sites.sh --watch' >/dev/null; then
+        # the watcher keeps config changes and renewals flowing: bring it back, catching up on what it missed
+        setsid "$0" --watch "" </dev/null >/proc/1/fd/1 2>&1 &
+        echo "40-sites.sh: watcher was not running; restarted" | tee /proc/1/fd/1
+    fi
+    exit 0 ;;
+--generate) ;;
+"")
+    if [ "${NGX_RENEW_LOOP:-1}" = 1 ]; then  # container boot
+        rm -f "$pidfile"  # a stale one from before a restart would make the watcher start too early
+        boot=$(envsum)
+        apply boot || :
+        "$0" --watch "$boot" &
+    else
+        apply boot || :  # native ExecStartPre: same fallback, systemd runs the renewals and reloads
+    fi
+    exit 0 ;;
+*) echo "usage: 40-sites.sh [--apply|--watch|--health]" >&2; exit 2 ;;
 esac
 
-# container boot: watch before reading ngx.env, so the watcher never inherits its values
-if [ "${NGX_RENEW_LOOP:-1}" = 1 ]; then "$0" --watch & fi
-
-if [ -f "$env_file" ]; then set -a; . "$env_file"; set +a; fi
+# --generate: everything below reads ngx.env and writes $out, nothing else
+src=${NGX_ENV_SNAPSHOT:-$env_file}
+if [ -s "$src" ]; then set -a; . "$src"; set +a; fi
 if [ -z "${SITES:-}" ]; then  # SITES removed -> drop the old generated config too
-    rm -f "$out"; [ "${NGX_RENEW_LOOP:-1}" = 0 ] || report "$(envsum) ok"; exit 0
+    rm -f "$out"; exit 0
 fi
 set -f  # no globbing while splitting SITES
 # docker entrypoint exports NGINX_LOCAL_RESOLVERS; natively, read resolv.conf (IPv6 needs [brackets])
@@ -80,6 +134,7 @@ for f in /etc/ssl/certs/ca-certificates.crt /etc/pki/tls/certs/ca-bundle.crt /et
 done
 
 die() { echo "40-sites.sh: $*" >&2; exit 1; }
+warn() { echo "40-sites.sh: warning: $*" >&2; }
 
 is_local() {
     case $1 in localhost|*.localhost|*.test|*.local|*.internal|*.home.arpa) return 0 ;; esac
@@ -95,7 +150,7 @@ issue_dns() {
     rc=0
     ACCOUNT_EMAIL=${ACME_EMAIL:-} acmesh --issue --dns "$DNS_PROVIDER" "$@" \
         --server "${ACME_URL:-letsencrypt}" ${ACME_CA:+--ca-bundle "$ACME_CA"} ${DNS_SLEEP:+--dnssleep "$DNS_SLEEP"} || rc=$?
-    [ $rc = 0 ] || [ $rc = 2 ] || die "DNS-01 issue failed for $domains"  # 2 = not due yet
+    [ $rc = 0 ] || [ $rc = 2 ] || return 1  # 2 = not due yet
     acmesh --install-cert -d "$first" --key-file "$certs/$first.key" --fullchain-file "$certs/$first.crt" \
         --reloadcmd 'nginx -s reload 2>/dev/null || true'
 }
@@ -208,20 +263,20 @@ for site in $SITES; do
     }" ;;
         *) proxy_loc "$target"; body="location / { $loc }" ;;
     esac
-    paths=
-    for d in $domains; do
-        [ -f "$tmp/loc.$d" ] || continue
-        paths="$paths$(cat "$tmp/loc.$d")
-"
-        rm "$tmp/loc.$d"
-    done
+    skip=
     if is_local "$first"; then
         local_cert
         tls="ssl_certificate $local/$file.crt;
     ssl_certificate_key $local/$file.key;"
     else
         case $key in
-            *\**) issue_dns >&2; wildcard=1  # stdout is the conf file
+            *\**) wildcard=1
+                 # A DNS provider outage must not block every other site's change: keep serving the
+                 # certificate we have, or leave just this site out until a retry succeeds.
+                 if ! issue_dns >&2; then  # stdout is the conf file
+                     if [ -f "$certs/$first.crt" ]; then warn "DNS-01 for $domains failed; serving its existing certificate"
+                     else warn "DNS-01 for $domains failed; site left out until a retry succeeds"; skip=1; fi
+                 fi
                  tls="ssl_certificate $certs/$first.crt;
     ssl_certificate_key $certs/$first.key;" ;;
             *)   public=1
@@ -231,6 +286,14 @@ for site in $SITES; do
     ssl_certificate_cache max=2;" ;;
         esac
     fi
+    paths=
+    for d in $domains; do
+        [ -f "$tmp/loc.$d" ] || continue
+        paths="$paths$(cat "$tmp/loc.$d")
+"
+        rm "$tmp/loc.$d"
+    done
+    [ -z "$skip" ] || continue
 cat >> "$tmp/servers" <<EOF
 
 server {
@@ -254,6 +317,7 @@ left=$(ls "$tmp" | sed -n 's/^loc\.//p' | xargs)
 
 {
 echo "resolver ${NGINX_LOCAL_RESOLVERS:?no resolver found} valid=30s;"
+echo "resolver_timeout 5s;"
 [ -z "$public" ] || cat <<EOF
 
 acme_issuer main {
@@ -287,6 +351,7 @@ gzip_types text/plain text/css text/xml application/json application/javascript 
 # responses stream (SSE) instead of buffering, big cookie/JWT headers fit.
 client_max_body_size 0;
 large_client_header_buffers 4 32k;
+proxy_connect_timeout 5s;  # a dead backend fails fast instead of hanging for nginx's default 60s
 proxy_read_timeout 1h;
 proxy_send_timeout 1h;
 proxy_buffering off;
@@ -320,5 +385,4 @@ EOF
 cat "$tmp/ups" "$tmp/servers"
 } > "$out.new"
 mv "$out.new" "$out"
-[ "${NGX_RENEW_LOOP:-1}" = 0 ] || report "$(envsum) ok"
 echo "40-sites.sh: wrote $out for: $SITES"

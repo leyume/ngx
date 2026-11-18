@@ -37,6 +37,7 @@ services:
       - ./run/www:/srv/www:ro
       - ./run/php:/srv/php:ro
       - ./run/ngx:/etc/ngx
+    healthcheck: { interval: 1h }  # the test runs --health itself, at the moments it needs
     networks: { default: { ipv4_address: 10.30.0.10 } }
 networks:
   default:
