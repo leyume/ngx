@@ -84,6 +84,7 @@ Included:
 | `LOCAL_CA_CERT`, `LOCAL_CA_KEY` | generated CA. Set both to sign with your own |
 | `LOCAL_CERT_DAYS` | `90`; renewed with a third left |
 | `HTTPS_REDIRECT` | `on`. `off` also serves every site over plain HTTP on :80 |
+| `IPV6` | `on`: also listen on `[::]` when the host has IPv6. `off` listens on IPv4 only |
 | `HTTPS_PORT` | `443`. Where the :80 redirect points when 443 is published elsewhere |
 
 DNS for each domain must point at the host, and ports 80 and 443 must be reachable.

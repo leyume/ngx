@@ -250,7 +250,12 @@ done
 
 redirect="https://\$host\$request_uri"
 [ "${HTTPS_PORT:-443}" = 443 ] || redirect="https://\$host:$HTTPS_PORT\$request_uri"
-plain=; [ "${HTTPS_REDIRECT:-on}" != off ] || plain="listen 80;"
+# IPv6 too, when the host has it: a site with an AAAA record is otherwise unreachable over IPv6, and
+# Let's Encrypt validates over IPv6 when it can. Same check as the official image's
+# 10-listen-on-ipv6-by-default.sh; IPV6=off skips it.
+v6=; [ "${IPV6:-on}" = off ] || [ ! -f /proc/net/if_inet6 ] || v6=1
+six() { [ -z "$v6" ] || printf '%s' "$*"; }  # "$(six 'listen [::]:443 ssl;')" = that line, or nothing
+plain=; [ "${HTTPS_REDIRECT:-on}" != off ] || plain="listen 80;$(six ' listen [::]:80;')"
 hide='location ~ /\.(?!well-known(/|$)) { return 404; }  # .git, .env, ...: 404 tells a scanner less than 403'
 # /dir -> /dir/ when it holds an index file (as Caddy does), so the page's relative links resolve.
 # Server level on purpose: an `if` inside a location turns off that location's try_files.
@@ -330,6 +335,8 @@ cat >> "$tmp/servers" <<EOF
 server {
     listen 443 ssl;
     listen 443 quic;
+    $(six 'listen [::]:443 ssl;
+    listen [::]:443 quic;')
     $plain
     http2 on;
     server_name $domains;
@@ -398,10 +405,15 @@ proxy_set_header Upgrade $http_upgrade;
 proxy_set_header Connection $connection_upgrade;
 map $http_upgrade $connection_upgrade { default upgrade; '' ''; }  # '' = no header, so backend keepalive works
 
+EOF
+cat <<EOF
+
 # unknown hostnames: drop the TLS handshake instead of leaking a cert
 server {
     listen 443 ssl default_server;
     listen 443 quic reuseport default_server;
+    $(six 'listen [::]:443 ssl default_server;
+    listen [::]:443 quic reuseport default_server;')
     ssl_reject_handshake on;
 }
 EOF
@@ -410,6 +422,7 @@ cat <<EOF
 # :80 -> https (ACME http-01 challenges are answered by the module before this)
 server {
     listen 80 default_server;
+    $(six 'listen [::]:80 default_server;')
     location / { return 301 $redirect; }
 }
 EOF
