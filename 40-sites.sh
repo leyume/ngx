@@ -407,10 +407,14 @@ proxy_buffer_size 64k;
 proxy_buffers 16 16k;  # with 64k above, so nginx accepts the busy-buffers default
 proxy_http_version 1.1;
 proxy_set_header Host $ngx_proxy_host;  # the client's, except for https origins (map below)
+# The client's host as it asked for it. HTTP/3 has no Host header, only :authority, so $http_host is
+# empty there and an upstream would get no Host at all (and refuse Origin checks, or route wrongly);
+# $host falls back to :authority. HTTP/1.1 and HTTP/2 keep $http_host, port included.
+map $http_host $ngx_client_host { "" $host; default $http_host; }
 proxy_set_header X-Real-IP $remote_addr;
 proxy_set_header X-Forwarded-For $remote_addr;  # replace, not append: a client-sent X-Forwarded-For is spoofable
 proxy_set_header X-Forwarded-Proto $scheme;
-proxy_set_header X-Forwarded-Host $http_host;
+proxy_set_header X-Forwarded-Host $ngx_client_host;
 proxy_set_header Upgrade $http_upgrade;
 proxy_set_header Connection $connection_upgrade;
 map $http_upgrade $connection_upgrade { default upgrade; '' ''; }  # '' = no header, so backend keepalive works
@@ -438,7 +442,7 @@ server {
 EOF
 echo
 echo 'map $proxy_host $ngx_proxy_host {'
-echo '    default $http_host;'
+echo '    default $ngx_client_host;'
 cat "$tmp/hosts"
 echo '}'
 cat "$tmp/ups" "$tmp/servers"
