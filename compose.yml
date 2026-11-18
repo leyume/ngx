@@ -1,0 +1,22 @@
+services:
+  web:
+    image: leyume/ngx
+    build: .
+    restart: unless-stopped
+    ports: ["80:80", "443:443", "443:443/udp"]
+    environment:
+      SITES: >-
+        example.com,www.example.com=app:3000
+        static.example.com=/srv/www
+        example.org,*.example.org=app:3000
+      ACME_EMAIL: you@example.com
+      DNS_PROVIDER: dns_cf          # only needed for wildcard entries
+      CF_Token: ${CF_TOKEN}
+    volumes:
+      - acme:/var/cache/nginx/acme     # certs + account survive restarts
+      - ./www:/srv/www:ro
+  app:
+    image: traefik/whoami
+    command: --port 3000
+volumes:
+  acme:

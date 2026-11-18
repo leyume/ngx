@@ -1,0 +1,30 @@
+# End-to-end: real ACME issuance (http-01 native + dns-01 wildcard) against Pebble. Run: sh test/run.sh
+services:
+  challtestsrv:  # mock DNS: every A lookup -> web, TXT records set via HTTP API
+    image: ghcr.io/letsencrypt/pebble-challtestsrv:latest
+    command: -defaultIPv6 "" -defaultIPv4 10.30.0.10
+    networks: { default: { ipv4_address: 10.30.0.3 } }
+  pebble:
+    image: ghcr.io/letsencrypt/pebble:latest
+    command: -config /cfg/pebble.json -dnsserver 10.30.0.3:8053
+    environment: { PEBBLE_VA_NOSLEEP: "1", PEBBLE_WFE_NONCEREJECT: "0" }
+    volumes: [./pebble.json:/cfg/pebble.json:ro]
+  app:
+    image: traefik/whoami
+  web:
+    build: ..
+    depends_on: [pebble, challtestsrv]
+    environment:
+      SITES: "site.test=app:80 files.test=/usr/share/nginx/html wild.test,*.wild.test=app:80"
+      ACME_URL: https://pebble:14000/dir
+      ACME_CA: /pebble.minica.pem
+      ACME_EMAIL: admin@site.test
+      DNS_PROVIDER: dns_challtest
+      DNS_SLEEP: "1"
+    volumes:
+      - ./pebble.minica.pem:/pebble.minica.pem:ro
+      - ./dns_challtest.sh:/opt/acme.sh/dnsapi/dns_challtest.sh:ro
+    networks: { default: { ipv4_address: 10.30.0.10 } }
+networks:
+  default:
+    ipam: { config: [{ subnet: 10.30.0.0/24 }] }
