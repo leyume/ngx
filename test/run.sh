@@ -27,6 +27,11 @@ get site.example / | grep -q '^Hostname:';                                     o
 get files.example / | grep -q 'Welcome to nginx';                              ok "static"
 r curl -sI http://localhost/x -H 'Host: site.example' | grep -q 'Location: https://site.example/x'; ok "redirect"
 if get nope.example / >/dev/null 2>&1; then exit 1; fi;                       ok "unknown host rejected"
+# IPv6: listened on whenever the host has it; and answered over ::1 when the container has that address
+r sh -c '[ ! -f /proc/net/if_inet6 ] || grep -q "listen \[::\]:443 ssl;" /etc/nginx/conf.d/sites.conf'; ok "ipv6 listen"
+if r grep -q '^0\{31\}1 ' /proc/net/if_inet6 2>/dev/null; then
+  r curl -sfk -g --resolve 'site.example:443:[::1]' https://site.example/ | grep -q '^Hostname:'; ok "ipv6 proxy"
+fi
 get site.example / -I | grep -qi 'strict-transport';                           ok "hsts"
 get any.wild.example / | grep -q '^Hostname:';                                 ok "wildcard"
 serial() { r curl -svk --resolve any.wild.example:443:127.0.0.1 https://any.wild.example/ 2>&1 | grep -E 'serial|start date'; }
