@@ -25,7 +25,7 @@ done
 r curl -svk --resolve site.example:443:127.0.0.1 https://site.example/ 2>&1 | grep -q 'issuer: CN=Pebble'; ok "acme cert"
 r grep -q 'acme_shared_zone zone=ngx_acme_shared:1024k;' /etc/nginx/conf.d/sites.conf;    ok "acme zone sized"
 get site.example / | grep -q '^Hostname:';                                     ok "proxy"
-get site.example / | grep -q '^Host: site.example$';                           ok "container upstream gets the client's Host"
+out=$(get site.example /); echo "$out" | tr -d '\r' | grep -q '^Host: site\.example$' || { echo "$out"; exit 1; }; ok "container upstream gets the client's Host"
 r grep -Eq '^    up[0-9]+ pebble;$' /etc/nginx/conf.d/sites.conf;                ok "https origin gets its own name as Host"
 get files.example / | grep -q 'Welcome to nginx';                              ok "static"
 r curl -sI http://localhost/x -H 'Host: site.example' | grep -q 'Location: https://site.example/x'; ok "redirect"
