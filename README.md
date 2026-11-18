@@ -84,6 +84,7 @@ Included:
 | `LOCAL_CA_CERT`, `LOCAL_CA_KEY` | generated CA. Set both to sign with your own |
 | `LOCAL_CERT_DAYS` | `90`; renewed with a third left |
 | `HTTPS_REDIRECT` | `on`. `off` also serves every site over plain HTTP on :80 |
+| `ACME_SHARED_ZONE` | sized from the site count: 32k each, rounded up to a power of two from `1m`. Memory for issued certificates and keys |
 | `IPV6` | `on`: also listen on `[::]` when the host has IPv6. `off` listens on IPv4 only |
 | `HTTPS_PORT` | `443`. Where the :80 redirect points when 443 is published elsewhere |
 
