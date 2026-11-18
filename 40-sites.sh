@@ -151,7 +151,7 @@ set -f  # no globbing while splitting SITES
 certs=$state/certs local=$state/local
 mkdir -p "$certs" "$local"
 tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
-: > "$tmp/ups"; : > "$tmp/servers"
+: > "$tmp/ups"; : > "$tmp/servers"; : > "$tmp/hosts"
 wildcard= public= n=0 cabundle=
 days=${LOCAL_CERT_DAYS:-90}
 # local leaves due for renewal (1/3 of their life left), found in one pass instead of an openssl per site
@@ -228,6 +228,10 @@ proxy_loc() {
     loc="proxy_pass $scheme://up$n${path:+$path\$request_uri};"
     if [ $scheme = https ]; then loc="$loc proxy_ssl_server_name on; proxy_ssl_name ${hp%:*};"; fi
     if [ -n "$verify" ]; then
+        # another server (an origin with a public certificate) knows itself by its own name, not by ours:
+        # sending it the client's Host gets a 404, a redirect, or a loop back to us. The map below sends
+        # this upstream its own name; container upstreams (and https+insecure ones) keep the client's.
+        echo "    up$n ${hp%:*};" >> "$tmp/hosts"
         loc="$loc proxy_ssl_verify on; proxy_ssl_verify_depth 4; proxy_ssl_trusted_certificate ${cabundle:?no CA bundle to verify https upstreams};"
     fi
 }
@@ -402,7 +406,7 @@ proxy_buffering off;
 proxy_buffer_size 64k;
 proxy_buffers 16 16k;  # with 64k above, so nginx accepts the busy-buffers default
 proxy_http_version 1.1;
-proxy_set_header Host $http_host;
+proxy_set_header Host $ngx_proxy_host;  # the client's, except for https origins (map below)
 proxy_set_header X-Real-IP $remote_addr;
 proxy_set_header X-Forwarded-For $remote_addr;  # replace, not append: a client-sent X-Forwarded-For is spoofable
 proxy_set_header X-Forwarded-Proto $scheme;
@@ -432,6 +436,11 @@ server {
     location / { return 301 $redirect; }
 }
 EOF
+echo
+echo 'map $proxy_host $ngx_proxy_host {'
+echo '    default $http_host;'
+cat "$tmp/hosts"
+echo '}'
 cat "$tmp/ups" "$tmp/servers"
 } > "$out.new"
 mv "$out.new" "$out"
