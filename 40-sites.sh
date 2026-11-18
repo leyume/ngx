@@ -39,6 +39,9 @@ pidfile=/run/nginx.pid
 envsum() { sha256sum "$env_file" 2>/dev/null | cut -d' ' -f1; }
 report() { (umask 022; printf '%s\n' "$@" | sed '/^$/d' > "$status.tmp" && mv "$status.tmp" "$status") 2>/dev/null || true; }
 acmesh() { /opt/acme.sh/acme.sh --home /opt/acme.sh --config-home "$state/dns" "$@"; }
+# File sharing (Docker Desktop, Kiri) can keep a stale entry after ngx.env is replaced by a rename:
+# it "exists" but can't be opened, sometimes for many seconds. Listing the directory refreshes it.
+refresh() { for _ in "${env_file%/*}"/*; do :; done; }
 nginx_up() { [ -f "$pidfile" ] && kill -0 "$(cat "$pidfile")" 2>/dev/null; }
 
 # Returns 0 = applied, 3 = applied with warnings, 1 = rejected (previous config kept).
@@ -46,7 +49,13 @@ apply() {  # $1: reload | boot
     # Read ngx.env once: the checksum we report and the config we build come from the same bytes,
     # even if the file changes (or is caught half-written) while we work.
     snap=$(mktemp)
-    if [ -f "$env_file" ]; then cat "$env_file" > "$snap"; sum=$(sha256sum < "$snap" | cut -d' ' -f1); else sum=; fi
+    refresh
+    if [ -e "$env_file" ]; then
+        if ! cat "$env_file" > "$snap" 2>/dev/null; then  # never build from a file we couldn't read
+            rm -f "$snap"; echo "40-sites.sh: can't read $env_file; config unchanged" >&2; return 1
+        fi
+        sum=$(sha256sum < "$snap" | cut -d' ' -f1)
+    else sum=; fi
     cp -p "$out" "$out.prev" 2>/dev/null || rm -f "$out.prev"
     if log=$(NGX_ENV_SNAPSHOT=$snap "$0" --generate 2>&1 && nginx -t 2>&1 && { [ "$1" = boot ] || nginx -s reload 2>&1; }); then
         rm -f "$snap"
@@ -77,19 +86,34 @@ case ${1:-} in
     rc=0; apply reload || rc=$?
     exit $rc ;;
 --watch)
-    # ponytail: 1s polling instead of inotify (not in the base image); sha256 of a few KB is free
-    last=${2:-}  # the ngx.env checksum boot built from ("" = apply once right away)
-    until nginx_up; do sleep 1; done  # a reload before nginx runs would fail and lose the change
-    t=0 period=43200
-    while sleep 1; do
-        t=$((t + 1)); s=$(envsum)
-        [ "$s" != "$last" ] || [ $t -ge $period ] || continue
-        # a file still being written reads differently a moment later: wait until it holds still
-        sleep 0.3; [ "$(envsum)" = "$s" ] || continue
-        [ $t -lt 43200 ] || [ ! -d "$state/dns" ] || acmesh --cron >/dev/null || :  # wildcard renewals
-        last=$s; t=0
+    # Polls every 0.1s: inotify never sees writes made through Docker Desktop's or Kiri's file sharing.
+    # Reading the file with `read` keeps each poll free of subprocesses.
+    until nginx_up; do sleep 0.1; done  # a reload before nginx runs would fail and lose the change
+    # One `read` of the whole file: a redirection that fails on a compound command (a while loop)
+    # kills a non-interactive shell, and file sharing briefly shows a renamed file as missing.
+    readenv() {
+        c=; IFS= read -r -d '' c 2>/dev/null < "$env_file" || :
+        [ -n "$c" ] || { refresh; IFS= read -r -d '' c 2>/dev/null < "$env_file" || :; }
+    }
+    # nap = sleep without starting a process: `read -t` on a pipe nobody writes to
+    fifo=$(mktemp -u); mkfifo "$fifo"; exec 8<>"$fifo"; rm -f "$fifo"
+    nap() { read -t "$1" _ <&8 || :; }
+    readenv; seen=$c
+    [ "$(envsum)" = "${2:-}" ] || "$0" --apply || :  # changed while booting ("" = always catch up)
+    ticks=0 period=432000  # 0.1s ticks: 12h
+    while nap 0.1; do
+        ticks=$((ticks + 1)); readenv
+        # an empty read (file missing, or caught mid-replace) is never a change: it would remove every site
+        [ -n "$c" ] || [ -z "$seen" ] || continue
+        if [ "$c" != "$seen" ]; then
+            # a file still being written reads differently a moment later: wait until it holds still
+            held=$c; nap 0.03; readenv; [ "$c" = "$held" ] || continue
+        elif [ $ticks -lt $period ]; then continue
+        fi
+        [ $ticks -lt 432000 ] || [ ! -d "$state/dns" ] || acmesh --cron >/dev/null || :  # wildcard renewals
+        seen=$c; ticks=0
         rc=0; "$0" --apply || rc=$?  # also renews local certificates nearing expiry
-        period=43200; [ $rc = 0 ] || period=300  # retry failures and warnings every 5 min
+        period=432000; [ $rc = 0 ] || period=3000  # retry failures and warnings every 5 min
     done ;;
 --health)
     nginx_up || { echo "nginx is not running"; exit 1; }
@@ -129,6 +153,9 @@ mkdir -p "$certs" "$local"
 tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
 : > "$tmp/ups"; : > "$tmp/servers"
 wildcard= public= n=0 cabundle=
+days=${LOCAL_CERT_DAYS:-90}
+# local leaves due for renewal (1/3 of their life left), found in one pass instead of an openssl per site
+stale=" $(find "$local" -name '*.crt' -mtime +$((days - days / 3 - 1)) 2>/dev/null | tr '\n' ' ') "
 for f in /etc/ssl/certs/ca-certificates.crt /etc/pki/tls/certs/ca-bundle.crt /etc/ssl/cert.pem; do
     if [ -f "$f" ]; then cabundle=$f; break; fi
 done
@@ -166,9 +193,11 @@ local_cert() {
         chmod 644 "$ca"
         echo "40-sites.sh: created local CA $ca; trust it to avoid browser warnings" >&2
     fi
-    days=${LOCAL_CERT_DAYS:-90} leaf=$local/$file
-    if [ -f "$leaf.crt" ] && [ "$(cat "$leaf.names" 2>/dev/null)" = "$domains" ] && [ "$ca" -ot "$leaf.crt" ] \
-        && openssl x509 -checkend $((days * 86400 / 3)) -noout -in "$leaf.crt" >/dev/null; then return 0; fi
+    leaf=$local/$file names=
+    [ ! -f "$leaf.names" ] || read -r names < "$leaf.names"
+    if [ -f "$leaf.crt" ] && [ "$names" = "$domains" ] && [ "$ca" -ot "$leaf.crt" ]; then
+        case $stale in *" $leaf.crt "*) ;; *) return 0 ;; esac
+    fi
     san=; for d in $domains; do san="$san${san:+,}DNS:$d"; done
     printf '%s\n' "subjectAltName=$san" extendedKeyUsage=serverAuth keyUsage=critical,digitalSignature \
         basicConstraints=critical,CA:FALSE authorityKeyIdentifier=keyid subjectKeyIdentifier=hash > "$tmp/ext"
@@ -203,10 +232,8 @@ proxy_loc() {
     fi
 }
 
-for site in $SITES; do
-    echo "$site" | grep -Eq '^[A-Za-z0-9.,*-]+(/[A-Za-z0-9._~/-]*\*?)?=[A-Za-z0-9._:/+~-]+$' \
-        || die "bad SITES entry '$site' (want domain[,domain][/path]=target)"
-done
+bad=$(printf '%s\n' $SITES | grep -Ev '^[A-Za-z0-9.,*-]+(/[A-Za-z0-9._~/-]*\*?)?=[A-Za-z0-9._:/+~-]+$' | head -1 || :)
+[ -z "$bad" ] || die "bad SITES entry '$bad' (want domain[,domain][/path]=target)"
 
 # path entries first: their locations go into the server block of the domain's own entry
 for site in $SITES; do
@@ -227,15 +254,19 @@ plain=; [ "${HTTPS_REDIRECT:-on}" != off ] || plain="listen 80;"
 hide='location ~ /\.(?!well-known(/|$)) { return 404; }  # .git, .env, ...: 404 tells a scanner less than 403'
 # /dir -> /dir/ when it holds an index file (as Caddy does), so the page's relative links resolve.
 # Server level on purpose: an `if` inside a location turns off that location's try_files.
-slash='set $dir_index ""; if ($uri !~ /$) { set $dir_index $request_filename/INDEX; } if (-f $dir_index) { return 308 $uri/$is_args$args; }'
+slash() { echo 'set $dir_index ""; if ($uri !~ /$) { set $dir_index $request_filename/'"$1"'; } if (-f $dir_index) { return 308 $uri/$is_args$args; }'; }
+slash_html=$(slash index.html) slash_php=$(slash index.php)
 
 for site in $SITES; do
     key=${site%%=*} target=${site#*=}
     case $key in */*) continue ;; esac
-    domains=$(echo "$key" | tr , ' ') first=${key%%,*} file=$(echo "${key%%,*}" | tr '*' '_')
+    first=${key%%,*}
+    IFS=,; set -- $key; IFS=' 	
+'; domains="$*"  # a,b -> "a b" without a subprocess
+    case $first in \**) file=_${first#\*} ;; *) file=$first ;; esac
     case $target in
         /*) body="root $target;
-    $(echo "$slash" | sed 's/INDEX/index.html/')
+    $slash_html
     $hide
     location / { try_files \$uri \$uri/ /index.html =404; }" ;;
         fastcgi://*)
@@ -245,7 +276,7 @@ for site in $SITES; do
             echo "upstream up$n { zone up$n 64k; server $hp resolve; keepalive 8; }" >> "$tmp/ups"
             body="root $root;
     index index.php index.html;
-    $(echo "$slash" | sed 's/INDEX/index.php/')
+    $slash_php
     $hide
     location / { try_files \$uri \$uri/ /index.php\$is_args\$args; }
     location ~ [^/]\.php(/|\$) {

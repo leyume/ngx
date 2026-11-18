@@ -65,6 +65,15 @@ echo "SITES='new.test=app:80'" > run/ngx/ngx.env
 wait_status | grep -q ' ok$';                                                  ok "reload reported"
 get new.test / | grep -q '^Hostname:';                                         ok "new site live"
 if get site.example / >/dev/null 2>&1; then exit 1; fi;                       ok "removed site gone"
+# fast: an atomic write is live in well under a second
+echo "SITES='new.test=app:80 fast.test=app2:80'" > run/ngx/ngx.env.tmp; h=$(sha256sum run/ngx/ngx.env.tmp | cut -d' ' -f1)
+t0=$(date +%s%N); mv run/ngx/ngx.env.tmp run/ngx/ngx.env
+until grep -q "^$h ok" run/ngx/ngx.status 2>/dev/null; do sleep 0.01; [ $(( ($(date +%s%N)-t0)/1000000 )) -lt 5000 ] || break; done
+ms=$(( ($(date +%s%N)-t0)/1000000 )); [ $ms -lt 1000 ];                         ok "change applied in ${ms} ms"
+# a missing ngx.env is never read as "no sites"
+mv run/ngx/ngx.env run/ngx/ngx.env.away; sleep 1
+get fast.test / | grep -q "Hostname: $app2";                                   ok "missing ngx.env leaves sites up"
+mv run/ngx/ngx.env.away run/ngx/ngx.env
 echo "SITES='new.test=app:80 bad=entry=x'" > run/ngx/ngx.env
 wait_status | grep -q ' error: .*bad SITES entry';                             ok "bad config reported"
 get new.test / | grep -q '^Hostname:';                                         ok "previous config still served"
