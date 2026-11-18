@@ -21,9 +21,9 @@ curl -fsSL https://raw.githubusercontent.com/leyume/ngx/main/install.sh \
 | | native (Linux + systemd) | `--docker` (macOS, others) |
 |---|---|---|
 | config | `/etc/ngx/ngx.env` | `~/.ngx/ngx.env` |
-| apply changes | `sudo systemctl reload nginx` (zero downtime) | `docker restart ngx` |
+| apply changes | save `ngx.env`: applied within a second, zero downtime | same |
 | app on the same machine | `127.0.0.1:3000` | `host.docker.internal:3000` |
-| wildcard renewals | `ngx-renew.timer` (daily) | built-in loop |
+| wildcard + local cert renewals | `ngx-renew.timer` (daily) | built-in loop (12h) |
 
 - Re-running the installer is safe: it keeps `ngx.env` and backs up an existing `nginx.conf` once.
 - In Docker mode, if ports 80/443 are busy on a dev machine, set `NGX_HTTP_PORT` / `NGX_HTTPS_PORT`.
@@ -37,7 +37,21 @@ docker run -d -p 80:80 -p 443:443 -p 443:443/udp -v ngx-acme:/var/cache/nginx/ac
 
 Or use `compose.yml`.
 
-`SITES` takes space-separated `domain[,domain]=target` entries. A target starting with `/` is served as static files. `host:port` or `http(s)://url` is reverse-proxied.
+`SITES` takes space-separated `domain[,domain][/path]=target` entries:
+
+| target | |
+|---|---|
+| `/srv/www` | static files. Unknown paths fall back to `/index.html` (single-page apps), `/dir` redirects to `/dir/`, and dotfiles (`.git`, `.env`, `.DS_Store`) answer 404 |
+| `app:3000`, `http://app:3000/prefix` | reverse proxy. A `/prefix` goes in front of the whole request path |
+| `https://origin.example.com` | reverse proxy to TLS, certificate verified against the system CAs |
+| `https+insecure://app:8443` | same without verification, for self-signed backends |
+| `fastcgi://php:9000/var/www` | PHP: files from the docroot, `*.php` to php-fpm, WordPress-style permalinks. Mount the docroot at the same path in both containers |
+
+`app.example.com/api*=api:8080` sends only that path prefix (or, without `*`, that exact path) to another proxy target; `app.example.com` needs its own entry too.
+
+**Live reload.** Edit `/etc/ngx/ngx.env` (mount the directory, not the file, and read-write): within a second the config is regenerated, checked with `nginx -t` and hot-reloaded. A rejected change leaves the running config in place. Either way `ngx.status` next to it gets `<sha256 of ngx.env> ok` or `... error: <why>`, so a program writing ngx.env can tell when its change is live.
+
+**Local domains.** `localhost`, `*.localhost`, `.test`, `.local`, `.internal`, `.home.arpa`, and anything listed in `TLS_INTERNAL`, get certificates from a local CA: offline, no DNS, wildcards included. The CA is generated once at `/var/cache/nginx/acme/local/ca.crt` (trust it to remove browser warnings), or bring one your machines already trust with `LOCAL_CA_CERT` / `LOCAL_CA_KEY` (Caddy's root works: `~/Library/Application Support/Caddy/pki/authorities/local/root.{crt,key}`).
 
 Included:
 - Let's Encrypt certificates issued and renewed automatically (HTTP-01). Keep `/var/cache/nginx/acme` on a volume.
@@ -45,7 +59,8 @@ Included:
   Set `DNS_PROVIDER` plus that provider's credentials, e.g. Cloudflare: `DNS_PROVIDER=dns_cf CF_Token=...`.
   The first certificate is issued before nginx starts. Renewal is checked every 12h, followed by a hot reload.
 - HTTP redirects to HTTPS, HSTS, HTTP/2 and HTTP/3 (publish `443/udp`)
-- Proxying with WebSocket upgrade and `X-Forwarded-*` / `X-Real-IP` headers
+- Proxying with WebSocket upgrade and `X-Forwarded-*` / `X-Real-IP` headers. A client-sent `X-Forwarded-For` is replaced, not trusted
+- Caddy-like proxy limits: no upload size limit, 1h read timeout (long polls, idle websockets), streamed responses (SSE), 32 KB request headers, 64 KB upstream headers
 - Upstreams resolved per request, so nginx boots even when an app is down
 - gzip and `server_tokens off`
 - Performance tuning, which matches or beats a hand-tuned raw nginx:
@@ -65,7 +80,12 @@ Included:
 | `ACME_CA` | CA file for a private ACME server (step-ca, pebble) |
 | `DNS_PROVIDER` | required for wildcard entries: acme.sh hook name (`dns_cf`, `dns_route53`, `dns_gd`, …) |
 | `DNS_SLEEP` | unset: acme.sh checks propagation over public DoH. Set to a number of seconds for a fixed wait instead |
+| `TLS_INTERNAL` | extra domains served from the local CA (`"a.dev b.dev"`, or `*` for all) |
+| `LOCAL_CA_CERT`, `LOCAL_CA_KEY` | generated CA. Set both to sign with your own |
+| `LOCAL_CERT_DAYS` | `90`; renewed with a third left |
+| `HTTPS_REDIRECT` | `on`. `off` also serves every site over plain HTTP on :80 |
+| `HTTPS_PORT` | `443`. Where the :80 redirect points when 443 is published elsewhere |
 
 DNS for each domain must point at the host, and ports 80 and 443 must be reachable.
 
-Test: `sh test/run.sh` issues real certificates against Pebble, Let's Encrypt's test CA.
+Test: `sh test/run.sh` issues real certificates against Pebble, Let's Encrypt's test CA, and checks every feature above end to end.

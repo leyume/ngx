@@ -8,8 +8,8 @@
 #   ./install.sh --docker   anywhere with Docker (default on macOS and other systems)
 #                           NGX_HTTP_PORT / NGX_HTTPS_PORT remap host ports (Let's Encrypt still needs public 80)
 #
-# Config: /etc/ngx/ngx.env (native) or ~/.ngx/ngx.env (docker). Edit it, then:
-#   native: sudo systemctl reload nginx      docker: docker restart ngx
+# Config: /etc/ngx/ngx.env (native) or ~/.ngx/ngx.env (docker). Saved edits apply within a second with
+# zero downtime; ngx.status next to it says "ok" or why a change was rejected (the old config keeps serving).
 set -eu
 
 RAW=${NGX_RAW:-https://raw.githubusercontent.com/leyume/ngx/main}
@@ -31,8 +31,9 @@ write_env() {
     mkdir -p "$(dirname "$1")"
     umask 077  # may hold DNS API tokens
     {
-        echo "# ngx config (shell syntax). Apply: native 'sudo systemctl reload nginx', docker 'docker restart ngx'"
-        echo "# SITES: space-separated domain[,domain]=target; target = host:port, http(s)://url, or /static/dir"
+        echo "# ngx config (shell syntax). Saved changes apply within a second; ngx.status says ok or why not."
+        echo "# SITES: space-separated domain[,domain][/path]=target; target = host:port, http(s)://url, /static/dir,"
+        echo "#   or fastcgi://php-fpm:9000/docroot. Local domains (.test, .localhost, ...) get certs from a local CA."
         echo "# Wildcards (*.example.com) need DNS_PROVIDER (acme.sh name, e.g. dns_cf) + its token, e.g. CF_Token=..."
         for k in SITES ACME_EMAIL ACME_URL ACME_CA DNS_PROVIDER DNS_SLEEP; do
             eval "v=\${$k:-}"
@@ -49,11 +50,11 @@ install_docker() {
     write_env "$conf/ngx.env"
     docker pull -q "$IMAGE" >/dev/null 2>&1 || docker image inspect "$IMAGE" >/dev/null || die "cannot pull $IMAGE"
     docker rm -f ngx >/dev/null 2>&1 || true
-    # dir mount (not file) so editors that replace the file are still seen after `docker restart ngx`
+    # dir mount (not file) so editors that replace the file are still seen; rw: ngx writes ngx.status there
     docker run -d --name ngx --restart unless-stopped \
         -p "${NGX_HTTP_PORT:-80}:80" -p "${NGX_HTTPS_PORT:-443}:443" -p "${NGX_HTTPS_PORT:-443}:443/udp" \
         --add-host host.docker.internal:host-gateway \
-        -v ngx-acme:/var/cache/nginx/acme -v "$conf":/etc/ngx:ro \
+        -v ngx-acme:/var/cache/nginx/acme -v "$conf":/etc/ngx \
         "$IMAGE" >/dev/null
     say "running container 'ngx' ($IMAGE). Apps on this machine: use host.docker.internal:PORT as the target."
     say "config: $conf/ngx.env   logs: docker logs -f ngx"
@@ -115,7 +116,8 @@ install_native() {
     [ -f /etc/nginx/conf.d/default.conf ] && mv /etc/nginx/conf.d/default.conf /etc/nginx/conf.d/default.conf.disabled
     write_env /etc/ngx/ngx.env
 
-    # generate config on every start/reload; reload = regenerate + zero-downtime HUP
+    # generate config on every start/reload; reload = regenerate + nginx -t + zero-downtime HUP, keeping
+    # the running config if the new one fails. ngx-apply.path reloads whenever ngx.env changes.
     mkdir -p /etc/systemd/system/nginx.service.d
     cat > /etc/systemd/system/nginx.service.d/ngx.conf <<'EOF'
 [Service]
@@ -123,17 +125,33 @@ Environment=NGX_RENEW_LOOP=0
 ExecStartPre=/usr/local/lib/ngx/40-sites.sh
 ExecStartPre=/usr/sbin/nginx -t -q
 ExecReload=
-ExecReload=/usr/local/lib/ngx/40-sites.sh
-ExecReload=/usr/sbin/nginx -s reload
+ExecReload=/usr/local/lib/ngx/40-sites.sh --apply
 # first wildcard cert waits for DNS propagation
 TimeoutStartSec=300
 EOF
+    cat > /etc/systemd/system/ngx-apply.path <<'EOF'
+[Unit]
+Description=ngx: apply /etc/ngx/ngx.env when it changes
+[Path]
+PathChanged=/etc/ngx/ngx.env
+Unit=ngx-apply.service
+[Install]
+WantedBy=multi-user.target
+EOF
+    cat > /etc/systemd/system/ngx-apply.service <<'EOF'
+[Unit]
+Description=ngx: regenerate and hot-reload nginx from /etc/ngx/ngx.env
+[Service]
+Type=oneshot
+ExecStart=/usr/local/lib/ngx/40-sites.sh --apply
+EOF
     cat > /etc/systemd/system/ngx-renew.service <<'EOF'
 [Unit]
-Description=ngx: renew wildcard certificates (acme.sh)
+Description=ngx: renew wildcard (acme.sh) and local-CA certificates
 [Service]
 Type=oneshot
 ExecStart=/opt/acme.sh/acme.sh --home /opt/acme.sh --config-home /var/cache/nginx/acme/dns --cron
+ExecStart=/usr/local/lib/ngx/40-sites.sh --apply
 EOF
     cat > /etc/systemd/system/ngx-renew.timer <<'EOF'
 [Unit]
@@ -146,11 +164,11 @@ Persistent=true
 WantedBy=timers.target
 EOF
     systemctl daemon-reload
-    systemctl enable -q nginx ngx-renew.timer
-    systemctl start ngx-renew.timer
+    systemctl enable -q nginx ngx-renew.timer ngx-apply.path
+    systemctl start ngx-renew.timer ngx-apply.path
     systemctl restart nginx || { journalctl -u nginx -n 30 --no-pager; die "nginx failed to start"; }
     say "nginx $(nginx -v 2>&1 | cut -d/ -f2) running with ngx config"
-    say "config: /etc/ngx/ngx.env   apply: sudo systemctl reload nginx   logs: journalctl -u nginx, /var/log/nginx/"
+    say "config: /etc/ngx/ngx.env (applied on save)   logs: journalctl -u nginx -u ngx-apply, /var/log/nginx/"
 }
 
 case "${1:-}" in

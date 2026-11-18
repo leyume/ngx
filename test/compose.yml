@@ -1,4 +1,5 @@
-# End-to-end: real ACME issuance (http-01 native + dns-01 wildcard) against Pebble. Run: sh test/run.sh
+# End-to-end: real ACME issuance (http-01 native + dns-01 wildcard) against Pebble, plus the local CA,
+# static/SPA, PHP, path routes, upstream TLS verification and live reload. Run: sh test/run.sh
 services:
   challtestsrv:  # mock DNS: every A lookup -> web, TXT records set via HTTP API
     image: ghcr.io/letsencrypt/pebble-challtestsrv:latest
@@ -11,19 +12,31 @@ services:
     volumes: [./pebble.json:/cfg/pebble.json:ro]
   app:
     image: traefik/whoami
+  app2:
+    image: traefik/whoami
+  php:
+    image: php:8.4-fpm-alpine
+    volumes: [./run/php:/srv/php:ro]  # same path as in web: fpm opens the SCRIPT_FILENAME nginx sends
   web:
     build: ..
     depends_on: [pebble, challtestsrv]
     environment:
-      SITES: "site.test=app:80 files.test=/usr/share/nginx/html wild.test,*.wild.test=app:80"
+      SITES: >-
+        site.example=app:80 files.example=/usr/share/nginx/html wild.example,*.wild.example=app:80
+        local.test=app:80 spa.test=/srv/www php.test=fastcgi://php:9000/srv/php
+        paths.test=app:80 paths.test/exact=app2:80 paths.test/pre/*=http://app2:80/v1/
+        verify.test=https://pebble:14000 insecure.test=https+insecure://pebble:14000
       ACME_URL: https://pebble:14000/dir
       ACME_CA: /pebble.minica.pem
-      ACME_EMAIL: admin@site.test
+      ACME_EMAIL: admin@site.example
       DNS_PROVIDER: dns_challtest
       DNS_SLEEP: "1"
     volumes:
       - ./pebble.minica.pem:/pebble.minica.pem:ro
       - ./dns_challtest.sh:/opt/acme.sh/dnsapi/dns_challtest.sh:ro
+      - ./run/www:/srv/www:ro
+      - ./run/php:/srv/php:ro
+      - ./run/ngx:/etc/ngx
     networks: { default: { ipv4_address: 10.30.0.10 } }
 networks:
   default:
