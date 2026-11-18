@@ -27,4 +27,4 @@ services:
     networks: { default: { ipv4_address: 10.30.0.10 } }
 networks:
   default:
-    ipam: { config: [{ subnet: 10.30.0.0/24 }] }
+    ipam: { config: [{ subnet: 10.30.0.0/24, ip_range: 10.30.0.128/25 }] }  # dynamic IPs from .128+, so static .3/.10 never collide
