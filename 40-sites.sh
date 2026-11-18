@@ -315,7 +315,7 @@ for site in $SITES; do
                  fi
                  tls="ssl_certificate $certs/$first.crt;
     ssl_certificate_key $certs/$first.key;" ;;
-            *)   public=1
+            *)   public=$((${public:-0} + 1))  # counted: sizes the module's shared zone below
                  tls="acme_certificate main;
     ssl_certificate \$acme_certificate;
     ssl_certificate_key \$acme_certificate_key;
@@ -356,6 +356,7 @@ left=$(ls "$tmp" | sed -n 's/^loc\.//p' | xargs)
 {
 echo "resolver ${NGINX_LOCAL_RESOLVERS:?no resolver found} valid=30s;"
 echo "resolver_timeout 5s;"
+zone=1024; while [ "$zone" -lt $(( ${public:-0} * 32 )) ]; do zone=$((zone * 2)); done
 [ -z "$public" ] || cat <<EOF
 
 acme_issuer main {
@@ -365,6 +366,11 @@ acme_issuer main {
 ${ACME_EMAIL:+    contact $ACME_EMAIL;}
 ${ACME_CA:+    ssl_trusted_certificate $ACME_CA;}
 }
+# Every certificate and key lives in this zone. The module's 256k default holds ~50 ECDSA keys and,
+# once full, fails each new one ("ngx_slab_alloc() failed: no memory") into handshakes that load
+# no certificate, with workers spinning on the retries. 32k per site is ~6x what one needs, rounded up
+# to a power of two from 1m: a resized zone starts empty on reload, so it should rarely change size.
+acme_shared_zone zone=ngx_acme_shared:${ACME_SHARED_ZONE:-${zone}k};
 EOF
 cat <<'EOF'
 
