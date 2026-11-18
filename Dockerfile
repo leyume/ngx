@@ -1,5 +1,19 @@
-# ponytail: nginx ships a native ACME module (auto-issue + auto-renew), so no certbot/cron.
+# nginx's native ACME module (auto-issue + auto-renew, no certbot/cron), rebuilt with acme/parallel.patch:
+# upstream issues certificates one at a time (~3s each); patched, up to 10 run at once, like Caddy.
+FROM nginx:mainline-alpine AS acme
+ARG ACME=v0.4.2
+RUN apk add --no-cache build-base cargo clang-dev git linux-headers openssl-dev pcre2-dev pkgconf zlib-dev \
+ && cd /tmp && curl -fsSL https://nginx.org/download/nginx-$NGINX_VERSION.tar.gz | tar -xz \
+ && git clone -q --depth 1 -b $ACME https://github.com/nginx/nginx-acme \
+ && cd nginx-acme && cargo fetch -q
+COPY acme/parallel.patch /tmp/
+# same nginx version and system OpenSSL as the final image, --with-compat: binary compatible with it
+RUN cd /tmp/nginx-acme && git apply /tmp/parallel.patch \
+ && cd /tmp/nginx-$NGINX_VERSION && ./configure --with-compat --with-http_ssl_module --add-dynamic-module=../nginx-acme \
+ && make modules
+
 FROM nginx:mainline-alpine
+COPY --from=acme /tmp/nginx-$NGINX_VERSION/objs/ngx_http_acme_module.so /usr/lib/nginx/modules/
 
 # acme.sh = DNS-01 for wildcards only (the native module has no DNS-01); ~150 DNS providers built in
 # coreutils: GNU date, so acme.sh can read cert expiry (busybox date cannot) and schedule renewals from it

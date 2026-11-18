@@ -1,0 +1,202 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index dcb6f3c..8db268d 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -278,6 +278,8 @@ async fn ngx_acme_update_certificates_for_issuer(
+     };
+ 
+     let mut next = Timestamp::MAX;
++    // ngx: orders that are due, issued concurrently after this loop instead of one by one
++    let mut due = std::vec::Vec::new();
+ 
+     for (order, cert) in issuer.orders.iter() {
+         let Some(cert) = cert.as_ref() else {
+@@ -330,45 +332,112 @@ async fn ngx_acme_update_certificates_for_issuer(
+             continue;
+         }
+ 
+-        if !client.is_ready() {
+-            match client.new_account().await? {
+-                acme::NewAccountOutput::Created(x) => {
+-                    info!(log, "account \"{x}\" created, {lctx}");
+-                    let _ = issuer.write_state_file(conf::issuer::ACCOUNT_URL_FILE, x.as_bytes());
+-                }
+-                acme::NewAccountOutput::Found(x) => {
+-                    debug!(log, "account \"{x}\" found, {lctx}");
++        due.push((order, cert));
++    }
++
++    if due.is_empty() {
++        return Ok(next);
++    }
++
++    if !client.is_ready() {
++        match client.new_account().await? {
++            acme::NewAccountOutput::Created(x) => {
++                info!(log, "account \"{x}\" created, acme issuer \"{}\"", issuer.name);
++                let _ = issuer.write_state_file(conf::issuer::ACCOUNT_URL_FILE, x.as_bytes());
++            }
++            acme::NewAccountOutput::Found(x) => {
++                debug!(log, "account \"{x}\" found, acme issuer \"{}\"", issuer.name);
++            }
++        }
++    }
++
++    let ari = client.supports_renewal_info().await?;
++    let client = &client;
++
++    // Like Caddy: up to 10 orders in flight at a time. One slow or failing domain no longer
++    // holds up the rest, and N new domains take about as long as one.
++    for batch in due.chunks(10) {
++        let tasks = batch
++            .iter()
++            .map(|&(order, cert)| issue_one(client, issuer, order, cert, ari))
++            .collect();
++        for res in join_all(tasks).await {
++            match res? {
++                Issued::Next(x) => next = cmp::min(next, x),
++                Issued::Skip => {}
++                Issued::RateLimited(x) => return Ok(x),
++            }
++        }
++    }
++    Ok(next)
++}
++
++enum Issued {
++    Next(Timestamp),
++    Skip,
++    RateLimited(Timestamp),
++}
++
++type IssueResult = Result<Issued, ngx::allocator::Box<dyn core::error::Error>>;
++
++/// Polls every future until all are done (all run on the one nginx event loop, no threads).
++async fn join_all<T>(
++    mut futs: std::vec::Vec<core::pin::Pin<std::boxed::Box<dyn core::future::Future<Output = T> + '_>>>,
++) -> std::vec::Vec<T> {
++    use core::task::Poll;
++    let mut out: std::vec::Vec<Option<T>> = futs.iter().map(|_| None).collect();
++    core::future::poll_fn(|cx| {
++        let mut pending = false;
++        for (f, o) in futs.iter_mut().zip(out.iter_mut()) {
++            if o.is_none() {
++                match f.as_mut().poll(cx) {
++                    Poll::Ready(v) => *o = Some(v),
++                    Poll::Pending => pending = true,
+                 }
+             }
+         }
++        if pending { Poll::Pending } else { Poll::Ready(()) }
++    })
++    .await;
++    out.into_iter().map(|o| o.unwrap()).collect()
++}
+ 
+-        let replaces = if client.supports_renewal_info().await? {
+-            cert.read().certificate_identifier(&*pool).ok()
+-        } else {
+-            None
+-        };
++fn issue_one<'a, Http>(
++    client: &'a AcmeClient<'a, Http>,
++    issuer: &'a conf::issuer::Issuer,
++    order: &'a conf::order::CertificateOrder<&'static str, ngx::core::Pool>,
++    cert: &'a SharedCertificateContext,
++    ari: bool,
++) -> core::pin::Pin<std::boxed::Box<dyn core::future::Future<Output = IssueResult> + 'a>>
++where
++    Http: net::http::HttpClient,
++    RequestError: From<<Http as net::http::HttpClient>::Error>,
++{
++    std::boxed::Box::pin(async move {
++        let log = ngx_cycle_log();
++        let order_id = order.cache_key();
++        let lctx = AcmeLogContext::for_order(issuer, &order_id);
++        let pool = crate::util::OwnedPool::with_default_size(log)?;
+ 
++        let replaces = if ari { cert.read().certificate_identifier(&*pool).ok() } else { None };
+         let replaces = replaces.as_ref().map(|x| x.as_ref());
+ 
+         let new_cert = match client.new_certificate(order, replaces).await {
+             Ok(x) => x,
+             Err(acme::error::NewCertificateError::Request(err @ RequestError::RateLimited(x))) => {
+                 warn!(log, "{err} while updating certificate, {lctx}");
+-                return Ok(Timestamp::now() + x);
++                return Ok(Issued::RateLimited(Timestamp::now() + x));
+             }
+             Err(ref err) if err.is_invalid() => {
+                 error!(log, "{err} while updating certificate, {lctx}");
+                 cert.write().set_invalid(&err);
+-
+-                // We marked the order as invalid and will stop attempting to update it until the
+-                // next configuration reload. It should not affect the next update schedule.
+-
+-                continue;
++                // invalid until the next configuration reload; doesn't affect the schedule
++                return Ok(Issued::Skip);
+             }
+             Err(ref err) => {
+                 warn!(log, "{err} while updating certificate, {lctx}");
+                 cert.write().set_error(&err);
+-                continue;
++                return Ok(Issued::Skip);
+             }
+         };
+ 
+@@ -377,7 +446,6 @@ async fn ngx_acme_update_certificates_for_issuer(
+         let valid = Interval::from_x509(&new_cert.x509[0]).unwrap_or(Interval::new(now, now));
+ 
+         // Write files even if we fail to update the shared zone later.
+-
+         if issuer.write_state_file(std::format!("{order_id}.crt"), &new_cert.bytes).is_err() {
+             warn!(log, "writing certificate to state directory failed, {lctx}");
+         } else if !matches!(order.key, conf::pkey::PrivateKey::File(_))
+@@ -386,39 +454,29 @@ async fn ngx_acme_update_certificates_for_issuer(
+             warn!(log, "writing private key to state directory failed, {lctx}");
+         }
+ 
+-        let res = cert.write().set(&new_cert.bytes, &pkey, valid);
+-        let mut cert_next = match res {
++        let mut cert_next = match cert.write().set(&new_cert.bytes, &pkey, valid) {
+             Ok(x) => x,
+             Err(err) => {
+                 warn!(log, "{err} while updating certificate, {lctx}");
+-                next = cmp::min(next, cert.write().set_error(&err));
+-                continue;
++                return Ok(Issued::Next(cert.write().set_error(&err)));
+             }
+         };
+ 
+         info!(log, "certificate issued, renewal scheduled at {cert_next}, {lctx}");
+ 
+-        // RFC9773 § 4.3: Clients SHOULD fetch a certificate's RenewalInfo immediately
+-        // after issuance.
+-
+-        if client.supports_renewal_info().await? {
+-            // Update cert.state for correct set_error behavior.
++        // RFC9773 § 4.3: Clients SHOULD fetch a certificate's RenewalInfo immediately after issuance.
++        if ari {
+             cert.write().schedule_renewal_info_update();
+-
+             cert_next = match CertificateIdentifier::from_x509(&new_cert.x509[0], &*pool) {
+-                Ok(identifier) => {
+-                    ngx_acme_update_renewal_info(&client, &identifier, cert, &lctx).await
+-                }
++                Ok(id) => ngx_acme_update_renewal_info(client, &id, cert, &lctx).await,
+                 Err(err) => {
+                     warn!(client, "{err} while updating renewal info, {lctx}");
+                     cert.write().set_error(&err)
+                 }
+-            }
++            };
+         }
+-
+-        next = cmp::min(next, cert_next);
+-    }
+-    Ok(next)
++        Ok(Issued::Next(cert_next))
++    })
+ }
+ 
+ async fn ngx_acme_update_renewal_info<Http>(

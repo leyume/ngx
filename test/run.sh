@@ -74,6 +74,12 @@ ms=$(( ($(date +%s%N)-t0)/1000000 )); [ $ms -lt 1000 ];                         
 mv run/ngx/ngx.env run/ngx/ngx.env.away; sleep 1
 get fast.test / | grep -q "Hostname: $app2";                                   ok "missing ngx.env leaves sites up"
 mv run/ngx/ngx.env.away run/ngx/ngx.env
+# ACME orders run in parallel (acme/parallel.patch): 8 new domains in about the time of one, not ~3s each
+s='new.test=app:80 fast.test=app2:80'; for i in 1 2 3 4 5 6 7 8; do s="$s p$i.example=app:80"; done
+echo "SITES='$s'" > run/ngx/ngx.env; wait_status >/dev/null; t0=$(date +%s)
+until [ "$(for i in 1 2 3 4 5 6 7 8; do get p$i.example / >/dev/null 2>&1 && echo y; done | grep -c y)" = 8 ]; do
+  sleep 0.5; [ $(($(date +%s) - t0)) -lt 60 ] || break; done
+s=$(($(date +%s) - t0)); [ $s -lt 12 ];                                        ok "8 new certificates in ${s}s"
 echo "SITES='new.test=app:80 bad=entry=x'" > run/ngx/ngx.env
 wait_status | grep -q ' error: .*bad SITES entry';                             ok "bad config reported"
 get new.test / | grep -q '^Hostname:';                                         ok "previous config still served"
