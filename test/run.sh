@@ -27,6 +27,14 @@ r grep -q 'acme_shared_zone zone=ngx_acme_shared:1024k;' /etc/nginx/conf.d/sites
 get site.example / | grep -q '^Hostname:';                                     ok "proxy"
 out=$(get site.example /); echo "$out" | tr -d '\r' | grep -q '^Host: site\.example$' || { echo "$out"; exit 1; }; ok "container upstream gets the client's Host"
 r grep -Eq '^    up[0-9]+ pebble;$' /etc/nginx/conf.d/sites.conf;                ok "https origin gets its own name as Host"
+# HTTP/3 carries the host as :authority, not a Host header: the upstream must still get it
+if r sh -c 'curl -V | grep -q HTTP3'; then
+  out=$(r curl -sk --http3-only --resolve site.example:443:127.0.0.1 https://site.example/)
+  echo "$out" | tr -d '\r' | grep -q '^Host: site\.example$' || { echo "$out"; exit 1; }; ok "http3: upstream gets the client's Host"
+  echo "$out" | tr -d '\r' | grep -q '^X-Forwarded-Host: site\.example$' || { echo "$out"; exit 1; }; ok "http3: X-Forwarded-Host"
+else
+  echo "skip http3 Host (this curl has no HTTP/3)"
+fi
 get files.example / | grep -q 'Welcome to nginx';                              ok "static"
 r curl -sI http://localhost/x -H 'Host: site.example' | grep -q 'Location: https://site.example/x'; ok "redirect"
 if get nope.example / >/dev/null 2>&1; then exit 1; fi;                       ok "unknown host rejected"
