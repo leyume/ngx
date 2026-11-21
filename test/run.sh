@@ -26,7 +26,8 @@ r curl -svk --resolve site.example:443:127.0.0.1 https://site.example/ 2>&1 | gr
 r grep -q 'acme_shared_zone zone=ngx_acme_shared:1024k;' /etc/nginx/conf.d/sites.conf;    ok "acme zone sized"
 get site.example / | grep -q '^Hostname:';                                     ok "proxy"
 out=$(get site.example /); echo "$out" | tr -d '\r' | grep -q '^Host: site\.example$' || { echo "$out"; exit 1; }; ok "container upstream gets the client's Host"
-r grep -Eq '^    up[0-9]+ pebble;$' /etc/nginx/conf.d/sites.conf;                ok "https origin gets its own name as Host"
+r grep -q '^    v_pebble_14000 pebble;$' /etc/nginx/conf.d/sites.conf;          ok "https origin gets its own name as Host"
+[ "$(r grep -c '^upstream h_app_80 ' /etc/nginx/conf.d/sites.conf)" = 1 ];    ok "one upstream per backend"
 # HTTP/3 carries the host as :authority, not a Host header: the upstream must still get it
 if r sh -c 'curl -V | grep -q HTTP3'; then
   out=$(r curl -sk --http3-only --resolve site.example:443:127.0.0.1 https://site.example/)

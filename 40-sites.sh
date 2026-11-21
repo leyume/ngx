@@ -122,7 +122,11 @@ case ${1:-} in
     exit $rc ;;
 --watch)
     # Polls every 0.1s: inotify never sees writes made through Docker Desktop's or Kiri's file sharing.
-    # Reading the file with `read` keeps each poll free of subprocesses.
+    # A poll only compares the file's mtime with a stamp holding the last one seen (one stat, no
+    # subprocess); the contents are read when that moved, and once a second regardless: busybox's -nt
+    # compares whole seconds, and file sharing can report a stale mtime. Changes come in bursts, so for
+    # 2s after one every poll reads again: a second change in the same second isn't left waiting. Reading every poll cost ~1.5%
+    # of a core for a 3 KB ngx.env (`read` takes it a byte per syscall).
     until nginx_up; do sleep 0.1; done  # a reload before nginx runs would fail and lose the change
     # One `read` of the whole file: a redirection that fails on a compound command (a while loop)
     # kills a non-interactive shell, and file sharing briefly shows a renamed file as missing.
@@ -133,13 +137,21 @@ case ${1:-} in
     # nap = sleep without starting a process: `read -t` on a pipe nobody writes to
     fifo=$(mktemp -u); mkfifo "$fifo"; exec 8<>"$fifo"; rm -f "$fifo"
     nap() { read -t "$1" _ <&8 || :; }
-    readenv; seen=$c
+    stamp=$(mktemp); touch -r "$env_file" "$stamp" 2>/dev/null || :
+    readenv; seen=$c pending= hot=0
     rc=${3:-0}  # how the boot apply went
     if [ "$(envsum)" != "${2:-}" ]; then rc=0; "$0" --apply || rc=$?; fi  # changed while booting ("" = always catch up)
     ticks=0 period=432000  # 0.1s ticks: 12h
     [ "$rc" = 0 ] || period=3000  # a failed or partial boot is retried like any other apply
     while nap 0.1; do
-        ticks=$((ticks + 1)); readenv
+        ticks=$((ticks + 1))
+        if [ "$env_file" -nt "$stamp" ]; then
+            touch -r "$env_file" "$stamp" 2>/dev/null || :; hot=20
+        elif [ -z "$pending" ] && [ $hot = 0 ] && [ $((ticks % 10)) != 0 ] && [ $ticks -lt $period ]; then
+            continue
+        fi
+        [ $hot = 0 ] || hot=$((hot - 1))
+        pending=; readenv
         # an empty read (file missing, or caught mid-replace) is never a change: it would remove every site.
         # The periodic pass still runs: it renews certificates from the last config read.
         if [ -z "$c" ] && [ -n "$seen" ]; then
@@ -147,8 +159,9 @@ case ${1:-} in
             c=$seen
         fi
         if [ "$c" != "$seen" ]; then
+            hot=20
             # a file still being written reads differently a moment later: wait until it holds still
-            held=$c; nap 0.03; readenv; [ "$c" = "$held" ] || continue
+            held=$c; nap 0.03; readenv; [ "$c" = "$held" ] || { pending=1; continue; }  # read again next poll
         elif [ $ticks -lt $period ]; then continue
         fi
         [ $ticks -lt 432000 ] || [ ! -d "$state/dns" ] || acmesh --cron >/dev/null || :  # wildcard renewals
@@ -194,7 +207,7 @@ mkdir -p "$certs" "$local"
 now=$(date +%s)
 tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
 : > "$tmp/ups"; : > "$tmp/servers"; : > "$tmp/hosts"
-wildcard= public= n=0 cabundle=
+wildcard= public= ups= cabundle=
 days=${LOCAL_CERT_DAYS:-90}
 # kernel TLS (`ssl_conf_command Options KTLS`) is an OpenSSL 3 option: 1.1.1 (RHEL 8, Debian 11) rejects
 # the whole config over it
@@ -284,6 +297,17 @@ server_arg() {
     esac
 }
 
+# Sets $up to the upstream block for kind (h http, s https, v https verified, f fastcgi) + host:port,
+# adding it the first time ($new=1). One block per target, named after it: entries sharing a backend
+# (xdev's deploy path on every host) share its zone and keepalive pool, and the names don't shift when
+# other entries come and go. The kind is in the name because the Host map below is keyed on it.
+upstream() {
+    up=$1_$(printf '%s' "$2" | tr -c 'A-Za-z0-9' _) new=
+    case " $ups " in *" $up "*) return ;; esac
+    ups="$ups $up" new=1
+    echo "upstream $up { zone $up 64k; server $(server_arg "$2"); keepalive $3; }" >> "$tmp/ups"
+}
+
 # Sets $loc for a proxy target and adds its upstream (re-resolved at runtime, so nginx boots
 # even when the app is down, and keeps backend connections alive).
 proxy_loc() {
@@ -295,17 +319,17 @@ proxy_loc() {
     hp=${1#*://} path=
     case $hp in */*) path=/${hp#*/}; hp=${hp%%/*} ;; esac
     case $hp in *:*) ;; *) hp=$hp:$port ;; esac
-    n=$((n + 1))
-    echo "upstream up$n { zone up$n 64k; server $(server_arg "$hp"); keepalive 32; }" >> "$tmp/ups"
+    kind=h; [ $scheme = http ] || kind=s; [ -z "$verify" ] || kind=v
+    upstream "$kind" "$hp" 32
     # a /prefix goes in front of the whole original URI (Caddy's `rewrite * /prefix{uri}`)
     path=${path%/}
-    loc="proxy_pass $scheme://up$n${path:+$path\$request_uri};"
+    loc="proxy_pass $scheme://$up${path:+$path\$request_uri};"
     if [ $scheme = https ]; then loc="$loc proxy_ssl_server_name on; proxy_ssl_name ${hp%:*};"; fi
     if [ -n "$verify" ]; then
         # another server (an origin with a public certificate) knows itself by its own name, not by ours:
         # sending it the client's Host gets a 404, a redirect, or a loop back to us. The map below sends
         # this upstream its own name; container upstreams (and https+insecure ones) keep the client's.
-        echo "    up$n ${hp%:*};" >> "$tmp/hosts"
+        [ -z "$new" ] || echo "    $up ${hp%:*};" >> "$tmp/hosts"
         loc="$loc proxy_ssl_verify on; proxy_ssl_verify_depth 4; proxy_ssl_trusted_certificate ${cabundle:?no CA bundle to verify https upstreams};"
     fi
 }
@@ -391,8 +415,7 @@ for site in $SITES; do
             hp=${target#fastcgi://}; root=/${hp#*/}; hp=${hp%%/*}
             case $root in /|"/$hp") die "'$site': fastcgi target needs a docroot, e.g. fastcgi://php:9000/var/www" ;; esac
             root=$(root_of "$root")
-            n=$((n + 1))
-            echo "upstream up$n { zone up$n 64k; server $(server_arg "$hp"); keepalive 8; }" >> "$tmp/ups"
+            upstream f "$hp" 8
             body="root \"$root\";
     index index.php index.html;
     $slash_php
@@ -409,7 +432,7 @@ for site in $SITES; do
         fastcgi_buffers 16 16k;
         fastcgi_read_timeout 1h;
         fastcgi_keep_conn on;
-        fastcgi_pass up$n;
+        fastcgi_pass $up;
     }" ;;
         *) proxy_loc "$target"; body="location / { $loc }" ;;
     esac
