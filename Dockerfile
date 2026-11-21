@@ -15,11 +15,13 @@ RUN cd /tmp/nginx-acme && git apply /tmp/parallel.patch \
 FROM nginx:mainline-alpine
 COPY --from=acme /tmp/nginx-$NGINX_VERSION/objs/ngx_http_acme_module.so /usr/lib/nginx/modules/
 
+# /var/cache/nginx/acme stays root's: only module/ (the ACME module's state) belongs to nginx's workers
 # acme.sh = DNS-01 for wildcards only (the native module has no DNS-01); ~150 DNS providers built in
 # coreutils: GNU date, so acme.sh can read cert expiry (busybox date cannot) and schedule renewals from it
 ARG ACMESH=3.1.6
 RUN rm /etc/nginx/conf.d/default.conf \
- && mkdir -p /var/cache/nginx/acme /opt/acme.sh && chown nginx:nginx /var/cache/nginx/acme \
+ && mkdir -p /var/cache/nginx/acme/module /opt/acme.sh && chown nginx:nginx /var/cache/nginx/acme/module \
+ && chmod 700 /var/cache/nginx/acme/module \
  && apk add --no-cache openssl coreutils \
  && curl -fsSL https://github.com/acmesh-official/acme.sh/archive/refs/tags/$ACMESH.tar.gz \
     | tar -xz -C /opt/acme.sh --strip-components=1 acme.sh-$ACMESH/acme.sh acme.sh-$ACMESH/dnsapi

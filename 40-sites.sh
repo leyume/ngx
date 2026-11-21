@@ -6,12 +6,14 @@
 #           host:port, http(s)://host[:port][/prefix]   reverse proxy; https upstreams are verified
 #           https+insecure://host[:port]   same, without verifying the upstream's certificate
 #           fastcgi://host:port/docroot    PHP: files from docroot, *.php to php-fpm (WordPress-style permalinks)
+#           A /dir or docroot can carry %XX escapes for bytes SITES can't hold: "/srv/my%20site".
 #   /path   only that exact request path (path* = prefix) goes to target, which must be a proxy;
 #           the domain needs its own entry too. e.g. "app.test=/srv/app app.test/api*=api:8080"
 # TLS: public domains get Let's Encrypt via nginx's ACME module (http-01); wildcards use DNS-01 via acme.sh,
 #   needing DNS_PROVIDER (acme.sh name, e.g. dns_cf) + that provider's env vars (e.g. CF_Token).
 #   Local domains (localhost, *.localhost, .test, .local, .internal, .home.arpa) and those in TLS_INTERNAL
 #   ("a.dev b.dev", or "*" for all) get certificates from a local CA instead: offline, no DNS, wildcards too.
+#   An entry mixing both kinds ("shop.com,shop.test=...") is served as two sites, one per kind.
 #   LOCAL_CA_CERT + LOCAL_CA_KEY sign with your own CA (one browsers already trust); otherwise one is
 #   generated in /var/cache/nginx/acme/local/ca.crt. LOCAL_CERT_DAYS (90) = leaf lifetime, renewed at 1/3 left.
 # ACME_EMAIL, ACME_URL (default Let's Encrypt prod), ACME_CA (CA file for private ACME servers),
@@ -28,26 +30,52 @@
 #        --generate internal: write the config from ngx.env, nothing else
 # Every apply writes "<sha256 of ngx.env> ok" or "... error: <why>" to $NGX_STATUS (/etc/ngx/ngx.status),
 # followed by one line per warning, so whatever wrote ngx.env can tell when and whether it took effect.
+# Its last line, "features: ...", names what this version understands (pct = %-escaped roots), so a
+# writer can tell whether it may use them.
 set -eu
 env_file=/etc/ngx/ngx.env
 out=/etc/nginx/conf.d/sites.conf
 state=/var/cache/nginx/acme
-good=$state/last-good.conf  # on the state volume, so it survives the container being recreated
+# The ACME module's state (account key, certificates) is written by nginx's workers, and nginx makes that
+# directory theirs on every start, so it has one of its own: $state/module. The volume root and everything
+# root reads back - acme.sh's config, the fallback config - stay root's, so a worker can't swap them out.
+modstate=$state/module
+own=$state/ngx  # root only
+good=$own/last-good.conf  # on the state volume, so it survives the container being recreated
+features="features: pct"
 status=${NGX_STATUS:-/etc/ngx/ngx.status}
 pidfile=/run/nginx.pid
 
 envsum() { sha256sum "$env_file" 2>/dev/null | cut -d' ' -f1; }
-report() { (umask 022; printf '%s\n' "$@" | sed '/^$/d' > "$status.tmp" && mv "$status.tmp" "$status") 2>/dev/null || true; }
+report() { (umask 022; printf '%s\n' "$@" "$features" | sed '/^$/d' > "$status.tmp" && mv "$status.tmp" "$status") 2>/dev/null || true; }
 acmesh() { /opt/acme.sh/acme.sh --home /opt/acme.sh --config-home "$state/dns" "$@"; }
 # File sharing (Docker Desktop, Kiri) can keep a stale entry after ngx.env is replaced by a rename:
 # it "exists" but can't be opened, sometimes for many seconds. Listing the directory refreshes it.
 refresh() { for _ in "${env_file%/*}"/*; do :; done; }
 nginx_up() { [ -f "$pidfile" ] && kill -0 "$(cat "$pidfile")" 2>/dev/null; }
+# a root-owned directory nobody else can write: one that isn't (planted by a worker, or a symlink) is replaced
+root_dir() {
+    if [ -L "$1" ] || { [ -e "$1" ] && [ "$(stat -c %u "$1")" != 0 ]; }; then rm -rf "$1"; fi
+    mkdir -p "$1"; chmod go-w "$1"
+}
+secure_state() {
+    [ "$(id -u)" = 0 ] || { mkdir -p "$own" "$modstate"; return 0; }  # tests, rootless: nothing to guard
+    mkdir -p "$state"; chown root "$state"; chmod 755 "$state"
+    for d in "$own" "$state/dns" "$state/certs" "$state/local"; do root_dir "$d"; done
+    rm -f "$state/last-good.conf"  # where it used to be, writable by workers: never trusted again
+    if [ -L "$modstate" ] || [ ! -d "$modstate" ]; then
+        rm -f "$modstate"; mkdir -m 700 "$modstate"
+        # the module used to keep its files in $state itself: move them over once, so nothing is re-ordered
+        find "$state" -maxdepth 1 -type f -exec mv {} "$modstate"/ \;
+        chown -R nginx "$modstate" 2>/dev/null || :
+    fi
+}
 
 # Returns 0 = applied, 3 = applied with warnings, 1 = rejected (previous config kept).
 apply() {  # $1: reload | boot
     # Read ngx.env once: the checksum we report and the config we build come from the same bytes,
     # even if the file changes (or is caught half-written) while we work.
+    secure_state
     snap=$(mktemp)
     refresh
     if [ -e "$env_file" ]; then
@@ -70,7 +98,8 @@ apply() {  # $1: reload | boot
     rm -f "$snap"
     why=$(echo "$log" | grep -v -e '^40-sites.sh: wrote' -e 'syntax is ok$' -e 'is successful$' | tr '\n' ' ')
     if [ -f "$out.prev" ]; then mv "$out.prev" "$out"
-    elif [ -f "$good" ]; then cp -p "$good" "$out"; fi  # boot: the last config that worked
+    elif [ -f "$good" ]; then cp -p "$good" "$out"  # boot: the last config that worked
+    else rm -f "$out"; fi  # a rejected first config, with nothing to go back to: never left for a restart
     # never leave nginx unable to start: an unusable fallback is dropped, nginx then serves no sites
     [ "$1" != boot ] || nginx -t >/dev/null 2>&1 || rm -f "$out"
     report "$sum error: $why"
@@ -81,13 +110,23 @@ apply() {  # $1: reload | boot
 case ${1:-} in
 --apply)
     # one apply at a time (native: the path unit and `systemctl reload` can overlap)
-    exec 9>"${TMPDIR:-/tmp}/ngx-apply.lock"
+    # in /run, which only root can write: a lock in /tmp could be held by any user
+    if [ -w /run ]; then exec 9>/run/ngx-apply.lock; else exec 9>"${TMPDIR:-/tmp}/ngx-apply.lock"; fi
     if command -v flock >/dev/null; then flock 9; fi
     rc=0; apply reload || rc=$?
+    # systemd's path unit ignores a change made while this ran: pick it up now (a few times at most)
+    i=0
+    while [ $i -lt 5 ] && [ -n "$sum" ] && [ "$(envsum)" != "$sum" ]; do
+        i=$((i + 1)); rc=0; apply reload || rc=$?
+    done
     exit $rc ;;
 --watch)
     # Polls every 0.1s: inotify never sees writes made through Docker Desktop's or Kiri's file sharing.
-    # Reading the file with `read` keeps each poll free of subprocesses.
+    # A poll only compares the file's mtime with a stamp holding the last one seen (one stat, no
+    # subprocess); the contents are read when that moved, and once a second regardless: busybox's -nt
+    # compares whole seconds, and file sharing can report a stale mtime. Changes come in bursts, so for
+    # 2s after one every poll reads again: a second change in the same second isn't left waiting. Reading every poll cost ~1.5%
+    # of a core for a 3 KB ngx.env (`read` takes it a byte per syscall).
     until nginx_up; do sleep 0.1; done  # a reload before nginx runs would fail and lose the change
     # One `read` of the whole file: a redirection that fails on a compound command (a while loop)
     # kills a non-interactive shell, and file sharing briefly shows a renamed file as missing.
@@ -98,16 +137,31 @@ case ${1:-} in
     # nap = sleep without starting a process: `read -t` on a pipe nobody writes to
     fifo=$(mktemp -u); mkfifo "$fifo"; exec 8<>"$fifo"; rm -f "$fifo"
     nap() { read -t "$1" _ <&8 || :; }
-    readenv; seen=$c
-    [ "$(envsum)" = "${2:-}" ] || "$0" --apply || :  # changed while booting ("" = always catch up)
+    stamp=$(mktemp); touch -r "$env_file" "$stamp" 2>/dev/null || :
+    readenv; seen=$c pending= hot=0
+    rc=${3:-0}  # how the boot apply went
+    if [ "$(envsum)" != "${2:-}" ]; then rc=0; "$0" --apply || rc=$?; fi  # changed while booting ("" = always catch up)
     ticks=0 period=432000  # 0.1s ticks: 12h
+    [ "$rc" = 0 ] || period=3000  # a failed or partial boot is retried like any other apply
     while nap 0.1; do
-        ticks=$((ticks + 1)); readenv
-        # an empty read (file missing, or caught mid-replace) is never a change: it would remove every site
-        [ -n "$c" ] || [ -z "$seen" ] || continue
+        ticks=$((ticks + 1))
+        if [ "$env_file" -nt "$stamp" ]; then
+            touch -r "$env_file" "$stamp" 2>/dev/null || :; hot=20
+        elif [ -z "$pending" ] && [ $hot = 0 ] && [ $((ticks % 10)) != 0 ] && [ $ticks -lt $period ]; then
+            continue
+        fi
+        [ $hot = 0 ] || hot=$((hot - 1))
+        pending=; readenv
+        # an empty read (file missing, or caught mid-replace) is never a change: it would remove every site.
+        # The periodic pass still runs: it renews certificates from the last config read.
+        if [ -z "$c" ] && [ -n "$seen" ]; then
+            [ $ticks -ge $period ] || continue
+            c=$seen
+        fi
         if [ "$c" != "$seen" ]; then
+            hot=20
             # a file still being written reads differently a moment later: wait until it holds still
-            held=$c; nap 0.03; readenv; [ "$c" = "$held" ] || continue
+            held=$c; nap 0.03; readenv; [ "$c" = "$held" ] || { pending=1; continue; }  # read again next poll
         elif [ $ticks -lt $period ]; then continue
         fi
         [ $ticks -lt 432000 ] || [ ! -d "$state/dns" ] || acmesh --cron >/dev/null || :  # wildcard renewals
@@ -130,8 +184,8 @@ case ${1:-} in
     if [ "${NGX_RENEW_LOOP:-1}" = 1 ]; then  # container boot
         rm -f "$pidfile"  # a stale one from before a restart would make the watcher start too early
         boot=$(envsum)
-        apply boot || :
-        "$0" --watch "$boot" &
+        rc=0; apply boot || rc=$?
+        "$0" --watch "$boot" "$rc" &
     else
         apply boot || :  # native ExecStartPre: same fallback, systemd runs the renewals and reloads
     fi
@@ -150,12 +204,14 @@ set -f  # no globbing while splitting SITES
 : "${NGINX_LOCAL_RESOLVERS:=$(awk '/^nameserver/ { print ($2 ~ ":") ? "[" $2 "]" : $2 }' /etc/resolv.conf | xargs)}"
 certs=$state/certs local=$state/local
 mkdir -p "$certs" "$local"
+now=$(date +%s)
 tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
 : > "$tmp/ups"; : > "$tmp/servers"; : > "$tmp/hosts"
-wildcard= public= n=0 cabundle=
+wildcard= public= ups= cabundle=
 days=${LOCAL_CERT_DAYS:-90}
-# local leaves due for renewal (1/3 of their life left), found in one pass instead of an openssl per site
-stale=" $(find "$local" -name '*.crt' -mtime +$((days - days / 3 - 1)) 2>/dev/null | tr '\n' ' ') "
+# kernel TLS (`ssl_conf_command Options KTLS`) is an OpenSSL 3 option: 1.1.1 (RHEL 8, Debian 11) rejects
+# the whole config over it
+ktls=; nginx -V 2>&1 | grep -Eq 'OpenSSL ([3-9]|[1-9][0-9])\.' && ktls=1
 for f in /etc/ssl/certs/ca-certificates.crt /etc/pki/tls/certs/ca-bundle.crt /etc/ssl/cert.pem; do
     if [ -f "$f" ]; then cabundle=$f; break; fi
 done
@@ -178,6 +234,8 @@ issue_dns() {
     ACCOUNT_EMAIL=${ACME_EMAIL:-} acmesh --issue --dns "$DNS_PROVIDER" "$@" \
         --server "${ACME_URL:-letsencrypt}" ${ACME_CA:+--ca-bundle "$ACME_CA"} ${DNS_SLEEP:+--dnssleep "$DNS_SLEEP"} || rc=$?
     [ $rc = 0 ] || [ $rc = 2 ] || return 1  # 2 = not due yet
+    # installed already and nothing new: installing again would reload nginx on every apply
+    [ $rc = 0 ] || [ ! -f "$certs/$first.crt" ] || [ ! -f "$certs/$first.key" ] || return 0
     acmesh --install-cert -d "$first" --key-file "$certs/$first.key" --fullchain-file "$certs/$first.crt" \
         --reloadcmd 'nginx -s reload 2>/dev/null || true'
 }
@@ -186,28 +244,68 @@ issue_dns() {
 local_cert() {
     ca=${LOCAL_CA_CERT:-$local/ca.crt} cakey=${LOCAL_CA_KEY:-$local/ca.key}
     if [ ! -f "$cakey" ]; then
-        [ -z "${LOCAL_CA_KEY:-}" ] || die "LOCAL_CA_KEY $cakey not found"
+        # never generate over a CA certificate of the user's own
+        [ -z "${LOCAL_CA_KEY:-}${LOCAL_CA_CERT:-}" ] || die "local CA key $cakey not found (LOCAL_CA_CERT and LOCAL_CA_KEY go together)"
         (umask 077; openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 3650 \
             -subj "/CN=ngx local CA" -addext basicConstraints=critical,CA:TRUE \
-            -addext keyUsage=critical,keyCertSign,cRLSign -keyout "$cakey" -out "$ca" 2>/dev/null)
+            -addext keyUsage=critical,keyCertSign,cRLSign -keyout "$cakey" -out "$ca" 2>"$tmp/err") \
+            || die "could not create the local CA: $(cat "$tmp/err")"
         chmod 644 "$ca"
         echo "40-sites.sh: created local CA $ca; trust it to avoid browser warnings" >&2
     fi
     leaf=$local/$file names=
     [ ! -f "$leaf.names" ] || read -r names < "$leaf.names"
     if [ -f "$leaf.crt" ] && [ "$names" = "$domains" ] && [ "$ca" -ot "$leaf.crt" ]; then
-        case $stale in *" $leaf.crt "*) ;; *) return 0 ;; esac
+        # due at 1/3 of its own lifetime left, from the dates recorded when it was issued (so changing
+        # LOCAL_CERT_DAYS or restoring files without their mtimes never pushes renewal past expiry);
+        # a leaf from before those were recorded asks openssl once
+        if [ -f "$leaf.life" ]; then
+            read -r issued expires < "$leaf.life"
+            [ "$now" -ge $((expires - (expires - issued) / 3)) ] || return 0
+        elif openssl x509 -checkend $((days * 86400 / 3)) -noout -in "$leaf.crt" >/dev/null 2>&1; then
+            return 0
+        fi
     fi
     san=; for d in $domains; do san="$san${san:+,}DNS:$d"; done
     printf '%s\n' "subjectAltName=$san" extendedKeyUsage=serverAuth keyUsage=critical,digitalSignature \
         basicConstraints=critical,CA:FALSE authorityKeyIdentifier=keyid subjectKeyIdentifier=hash > "$tmp/ext"
-    (umask 077; openssl req -new -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -subj "/CN=$first" \
-        -keyout "$tmp/key" -out "$tmp/csr" 2>/dev/null)
+    # a CN holds at most 64 bytes; the names that matter are in the SAN
+    cn=$first; [ ${#cn} -le 64 ] || cn="ngx local site"
+    (umask 077; openssl req -new -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -subj "/CN=$cn" \
+        -keyout "$tmp/key" -out "$tmp/csr" 2>"$tmp/err") || die "could not make a key for $first: $(cat "$tmp/err")"
     openssl x509 -req -in "$tmp/csr" -CA "$ca" -CAkey "$cakey" -set_serial "0x$(openssl rand -hex 16)" \
-        -days "$days" -extfile "$tmp/ext" -out "$tmp/crt" 2>/dev/null || die "local CA could not sign $first"
+        -days "$days" -extfile "$tmp/ext" -out "$tmp/crt" 2>"$tmp/err" || die "local CA could not sign $first: $(cat "$tmp/err")"
     # ponytail: always append the signer; clients ignore a root in the chain, and an intermediate is needed
     cat "$tmp/crt" "$ca" > "$leaf.crt.new"
     mv "$tmp/key" "$leaf.key"; mv "$leaf.crt.new" "$leaf.crt"; echo "$domains" > "$leaf.names"
+    echo "$now $((now + days * 86400))" > "$leaf.life"
+}
+
+# "server" argument for host:port. nginx's `resolve` asks only DNS (the resolver below), never
+# /etc/hosts, so a name that lives there - host.docker.internal from --add-host, localhost - would
+# never resolve: it is pinned to its address instead. Everything else re-resolves at runtime.
+hosts_file=${NGX_HOSTS_FILE:-/etc/hosts}
+server_arg() {
+    h=${1%:*} p=${1##*:}
+    case $h in \[*|*[!0-9.]*) ;; *) echo "$1 resolve"; return ;; esac  # IPv4 literal
+    case $h in \[*) echo "$1"; return ;; esac  # IPv6 literal
+    ip=$(awk -v h="$h" '$1 !~ /^#/ { for (i = 2; i <= NF; i++) if ($i == h) { print $1; exit } }' "$hosts_file" 2>/dev/null)
+    case $ip in
+        "") echo "$1 resolve" ;;
+        *:*) echo "[$ip]:$p" ;;
+        *) echo "$ip:$p" ;;
+    esac
+}
+
+# Sets $up to the upstream block for kind (h http, s https, v https verified, f fastcgi) + host:port,
+# adding it the first time ($new=1). One block per target, named after it: entries sharing a backend
+# (xdev's deploy path on every host) share its zone and keepalive pool, and the names don't shift when
+# other entries come and go. The kind is in the name because the Host map below is keyed on it.
+upstream() {
+    up=$1_$(printf '%s' "$2" | tr -c 'A-Za-z0-9' _) new=
+    case " $ups " in *" $up "*) return ;; esac
+    ups="$ups $up" new=1
+    echo "upstream $up { zone $up 64k; server $(server_arg "$2"); keepalive $3; }" >> "$tmp/ups"
 }
 
 # Sets $loc for a proxy target and adds its upstream (re-resolved at runtime, so nginx boots
@@ -221,23 +319,58 @@ proxy_loc() {
     hp=${1#*://} path=
     case $hp in */*) path=/${hp#*/}; hp=${hp%%/*} ;; esac
     case $hp in *:*) ;; *) hp=$hp:$port ;; esac
-    n=$((n + 1))
-    echo "upstream up$n { zone up$n 64k; server $hp resolve; keepalive 32; }" >> "$tmp/ups"
+    kind=h; [ $scheme = http ] || kind=s; [ -z "$verify" ] || kind=v
+    upstream "$kind" "$hp" 32
     # a /prefix goes in front of the whole original URI (Caddy's `rewrite * /prefix{uri}`)
     path=${path%/}
-    loc="proxy_pass $scheme://up$n${path:+$path\$request_uri};"
+    loc="proxy_pass $scheme://$up${path:+$path\$request_uri};"
     if [ $scheme = https ]; then loc="$loc proxy_ssl_server_name on; proxy_ssl_name ${hp%:*};"; fi
     if [ -n "$verify" ]; then
         # another server (an origin with a public certificate) knows itself by its own name, not by ours:
         # sending it the client's Host gets a 404, a redirect, or a loop back to us. The map below sends
         # this upstream its own name; container upstreams (and https+insecure ones) keep the client's.
-        echo "    up$n ${hp%:*};" >> "$tmp/hosts"
+        [ -z "$new" ] || echo "    $up ${hp%:*};" >> "$tmp/hosts"
         loc="$loc proxy_ssl_verify on; proxy_ssl_verify_depth 4; proxy_ssl_trusted_certificate ${cabundle:?no CA bundle to verify https upstreams};"
     fi
 }
 
-bad=$(printf '%s\n' $SITES | grep -Ev '^[A-Za-z0-9.,*-]+(/[A-Za-z0-9._~/-]*\*?)?=[A-Za-z0-9._:/+~-]+$' | head -1 || :)
+bad=$(printf '%s\n' $SITES | grep -Ev '^[A-Za-z0-9.,*-]+(/[A-Za-z0-9._~/-]*\*?)?=[A-Za-z0-9._:/+~%-]+$' | head -1 || :)
 [ -z "$bad" ] || die "bad SITES entry '$bad' (want domain[,domain][/path]=target)"
+
+# %XX -> the byte, for root paths; a root nginx can't hold in quotes ($ " \ or a control byte) is refused
+unpct() {
+    case $1 in *%*) ;; *) printf '%s' "$1"; return ;; esac
+    printf '%s' "$1" | LC_ALL=C awk 'BEGIN { for (i = 1; i < 256; i++) hex[sprintf("%02X", i)] = i }
+        { s = $0; o = ""
+          while ((i = index(s, "%")) > 0) {
+              h = toupper(substr(s, i + 1, 2)); o = o substr(s, 1, i - 1)
+              if (h in hex) { o = o sprintf("%c", hex[h]); s = substr(s, i + 3) } else { o = o "%"; s = substr(s, i + 1) }
+          }
+          printf "%s", o s }'
+}
+root_of() {
+    r=$(unpct "$1")
+    case $r in *[\"\\\$]*|*[[:cntrl:]]*) die "'$site': root '$r' has a character nginx can't take (\" \\ \$ or a control byte)" ;; esac
+    printf '%s' "$r"
+}
+
+# An entry naming both local and public domains gets two server blocks: each kind has its own certificate
+# (local CA vs ACME), and one order can't cover both. Path entries still find their domain's block.
+split=
+for site in $SITES; do
+    key=${site%%=*} target=${site#*=}
+    case $key in
+        */*) split="$split $site"; continue ;;  # a path entry: attaches by domain
+        *,*) ;;
+        *) split="$split $site"; continue ;;
+    esac
+    lk= pk=
+    IFS=,; for d in $key; do if is_local "$d"; then lk="$lk${lk:+,}$d"; else pk="$pk${pk:+,}$d"; fi; done
+    IFS=' 	
+'
+    if [ -n "$lk" ] && [ -n "$pk" ]; then split="$split $pk=$target $lk=$target"; else split="$split $site"; fi
+done
+SITES=${split# }
 
 # path entries first: their locations go into the server block of the domain's own entry
 for site in $SITES; do
@@ -274,16 +407,16 @@ for site in $SITES; do
 '; domains="$*"  # a,b -> "a b" without a subprocess
     case $first in \**) file=_${first#\*} ;; *) file=$first ;; esac
     case $target in
-        /*) body="root $target;
+        /*) body="root \"$(root_of "$target")\";
     $slash_html
     $hide
     location / { try_files \$uri \$uri/ /index.html =404; }" ;;
         fastcgi://*)
             hp=${target#fastcgi://}; root=/${hp#*/}; hp=${hp%%/*}
             case $root in /|"/$hp") die "'$site': fastcgi target needs a docroot, e.g. fastcgi://php:9000/var/www" ;; esac
-            n=$((n + 1))
-            echo "upstream up$n { zone up$n 64k; server $hp resolve; keepalive 8; }" >> "$tmp/ups"
-            body="root $root;
+            root=$(root_of "$root")
+            upstream f "$hp" 8
+            body="root \"$root\";
     index index.php index.html;
     $slash_php
     $hide
@@ -299,11 +432,15 @@ for site in $SITES; do
         fastcgi_buffers 16 16k;
         fastcgi_read_timeout 1h;
         fastcgi_keep_conn on;
-        fastcgi_pass up$n;
+        fastcgi_pass $up;
     }" ;;
         *) proxy_loc "$target"; body="location / { $loc }" ;;
     esac
     skip=
+    # HSTS pins a name to https for a year: not for local names (a dev domain shared by many tools)
+    # nor when plain http is served on purpose
+    hsts='add_header Strict-Transport-Security "max-age=31536000" always;'
+    if is_local "$first" || [ -n "$plain" ]; then hsts=; fi
     if is_local "$first"; then
         local_cert
         tls="ssl_certificate $local/$file.crt;
@@ -347,15 +484,17 @@ server {
 
     $tls
 
-    add_header Strict-Transport-Security "max-age=31536000" always;
-    add_header Alt-Svc 'h3=":443"; ma=86400' always;
+    $hsts
+    add_header Alt-Svc 'h3=":${HTTPS_PORT:-443}"; ma=86400' always;
 
 $paths    $body
 }
 EOF
 done
+# a path whose domain has no entry of its own has no server block to go in: one such entry must not
+# hold every other site's change back, so it is left out with a warning
 left=$(ls "$tmp" | sed -n 's/^loc\.//p' | xargs)
-[ -z "$left" ] || die "path entries for $left have no site entry of their own"
+[ -z "$left" ] || warn "path entries for $left have no site entry of their own; left out"
 
 {
 echo "resolver ${NGINX_LOCAL_RESOLVERS:?no resolver found} valid=30s;"
@@ -365,7 +504,7 @@ zone=1024; while [ "$zone" -lt $(( ${public:-0} * 32 )) ]; do zone=$((zone * 2))
 
 acme_issuer main {
     uri ${ACME_URL:-https://acme-v02.api.letsencrypt.org/directory};
-    state_path $state;
+    state_path $modstate;
     accept_terms_of_service;
 ${ACME_EMAIL:+    contact $ACME_EMAIL;}
 ${ACME_CA:+    ssl_trusted_certificate $ACME_CA;}
@@ -376,6 +515,8 @@ ${ACME_CA:+    ssl_trusted_certificate $ACME_CA;}
 # to a power of two from 1m: a resized zone starts empty on reload, so it should rarely change size.
 acme_shared_zone zone=ngx_acme_shared:${ACME_SHARED_ZONE:-${zone}k};
 EOF
+# kernel TLS: lets sendfile work over HTTPS. Needs `modprobe tls` on the host; silently falls back otherwise.
+[ -z "$ktls" ] || printf '\nssl_conf_command Options KTLS;\n'
 cat <<'EOF'
 
 server_tokens off;
@@ -387,9 +528,6 @@ open_file_cache_valid 10s;
 # TLS resumption across workers (returning visitors skip the full handshake)
 ssl_session_cache shared:SSL:10m;
 ssl_session_timeout 1d;
-# kernel TLS: lets sendfile work over HTTPS. Needs `modprobe tls` on the host; silently falls back otherwise.
-ssl_conf_command Options KTLS;
-
 gzip on;
 gzip_vary on;
 gzip_proxied any;

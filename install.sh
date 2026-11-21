@@ -105,7 +105,7 @@ install_native() {
     mkdir -p /opt/acme.sh /usr/local/lib/ngx /var/cache/nginx/acme
     curl -fsSL "https://github.com/acmesh-official/acme.sh/archive/refs/tags/$ACMESH.tar.gz" \
         | tar -xz -C /opt/acme.sh --strip-components=1 "acme.sh-$ACMESH/acme.sh" "acme.sh-$ACMESH/dnsapi"
-    chown nginx:nginx /var/cache/nginx/acme
+    # root's: 40-sites.sh gives the ACME module its own module/ dir, the only part nginx's workers write
 
     fetch 40-sites.sh /usr/local/lib/ngx/40-sites.sh && chmod 755 /usr/local/lib/ngx/40-sites.sh
     fetch nginx.conf /tmp/ngx-nginx.conf
@@ -152,7 +152,8 @@ EOF
 Description=ngx: renew wildcard (acme.sh) and local-CA certificates
 [Service]
 Type=oneshot
-ExecStart=/opt/acme.sh/acme.sh --home /opt/acme.sh --config-home /var/cache/nginx/acme/dns --cron
+# "-": a failed wildcard renewal must not skip the local-CA renewals of the apply
+ExecStart=-/opt/acme.sh/acme.sh --home /opt/acme.sh --config-home /var/cache/nginx/acme/dns --cron
 ExecStart=/usr/local/lib/ngx/40-sites.sh --apply
 EOF
     cat > /etc/systemd/system/ngx-renew.timer <<'EOF'
