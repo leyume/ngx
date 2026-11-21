@@ -12,6 +12,7 @@ services:
     volumes: [./pebble.json:/cfg/pebble.json:ro]
   app:
     image: traefik/whoami
+    networks: { default: { ipv4_address: 10.30.0.20 } }  # fixed: web's /etc/hosts names it (extra_hosts)
   app2:
     image: traefik/whoami
   php:
@@ -26,13 +27,16 @@ services:
         local.test=app:80 spa.test=/srv/www php.test=fastcgi://php:9000/srv/php
         paths.test=app:80 paths.test/exact=app2:80 paths.test/pre/*=http://app2:80/v1/
         verify.test=https://pebble:14000 insecure.test=https+insecure://pebble:14000
+        hosts.test=hostsonly.internal:80 spaced.test=/srv/my%20www mixed.example,mixed.test=app:80
       ACME_URL: https://pebble:14000/dir
       ACME_CA: /pebble.minica.pem
       ACME_EMAIL: admin@site.example
       DNS_PROVIDER: dns_challtest
       DNS_SLEEP: "1"
+    extra_hosts: ["hostsonly.internal:10.30.0.20"]  # only in /etc/hosts, never in DNS (like host.docker.internal)
     volumes:
       - ./pebble.minica.pem:/pebble.minica.pem:ro
+      - { type: bind, source: ./run/www, target: /srv/my www, read_only: true }
       - ./dns_challtest.sh:/opt/acme.sh/dnsapi/dns_challtest.sh:ro
       - ./run/www:/srv/www:ro
       - ./run/php:/srv/php:ro

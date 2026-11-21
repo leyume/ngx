@@ -49,19 +49,19 @@ Or use `compose.yml`.
 
 `app.example.com/api*=api:8080` sends only that path prefix (or, without `*`, that exact path) to another proxy target; `app.example.com` needs its own entry too.
 
-**Live reload.** Edit `/etc/ngx/ngx.env` (mount the directory, not the file, and read-write): within a second the config is regenerated, checked with `nginx -t` and hot-reloaded. A rejected change leaves the running config in place. Programs should write it atomically (a temp file, then rename); ngx also waits for the file to stop changing, so a half-saved file is never applied. Either way `ngx.status` next to it gets `<sha256 of ngx.env> ok` or `... error: <why>`, so a program writing ngx.env can tell when its change is live.
+**Live reload.** Edit `/etc/ngx/ngx.env` (mount the directory, not the file, and read-write): within a second the config is regenerated, checked with `nginx -t` and hot-reloaded. A rejected change leaves the running config in place. Programs should write it atomically (a temp file, then rename); ngx also waits for the file to stop changing, so a half-saved file is never applied. Either way `ngx.status` next to it gets `<sha256 of ngx.env> ok` or `... error: <why>`, so a program writing ngx.env can tell when its change is live. Warnings follow on their own lines, and the last line, `features: ...`, names what this version understands (`pct`: `%XX` escapes in a static or PHP root, e.g. `site.test=/srv/my%20site`).
 
 **Local domains.** `localhost`, `*.localhost`, `.test`, `.local`, `.internal`, `.home.arpa`, and anything listed in `TLS_INTERNAL`, get certificates from a local CA: offline, no DNS, wildcards included. The CA is generated once at `/var/cache/nginx/acme/local/ca.crt` (trust it to remove browser warnings), or bring one your machines already trust with `LOCAL_CA_CERT` / `LOCAL_CA_KEY` (Caddy's root works: `~/Library/Application Support/Caddy/pki/authorities/local/root.{crt,key}`).
 
 Included:
-- Let's Encrypt certificates issued and renewed automatically (HTTP-01). Keep `/var/cache/nginx/acme` on a volume. The image builds the module with `acme/parallel.patch`, so up to 10 orders run at once: 10 new domains take about 5s instead of about 35s, and one failing domain doesn't hold up the others.
+- Let's Encrypt certificates issued and renewed automatically (HTTP-01). Keep `/var/cache/nginx/acme` on a volume. The module's state (account key, certificates) lives in its `module/` directory, the only part nginx's workers can write; the rest stays root's. The image builds the module with `acme/parallel.patch`, so up to 10 orders run at once: 10 new domains take about 5s instead of about 35s, and one failing domain doesn't hold up the others.
 - Wildcards: `example.com,*.example.com=app:3000` goes through DNS-01 via [acme.sh](https://github.com/acmesh-official/acme.sh/wiki/dnsapi), the same approach as Caddy's DNS plugins.
   Set `DNS_PROVIDER` plus that provider's credentials, e.g. Cloudflare: `DNS_PROVIDER=dns_cf CF_Token=...`.
   The first certificate is issued before nginx starts. Renewal is checked every 12h, followed by a hot reload.
-- HTTP redirects to HTTPS, HSTS, HTTP/2 and HTTP/3 (publish `443/udp`)
+- HTTP redirects to HTTPS, HSTS (public names only), HTTP/2 and HTTP/3 (publish `443/udp`)
 - Proxying with WebSocket upgrade and `X-Forwarded-*` / `X-Real-IP` headers. A client-sent `X-Forwarded-For` is replaced, not trusted
 - Caddy-like proxy limits: no upload size limit, 1h read timeout (long polls, idle websockets), streamed responses (SSE), 32 KB request headers, 64 KB upstream headers
-- Upstreams resolved per request, so nginx boots even when an app is down
+- Upstreams resolved per request, so nginx boots even when an app is down. A name only in `/etc/hosts` (`host.docker.internal` from `--add-host`, `localhost`) is pinned to its address, since nginx's runtime resolver only asks DNS
 - gzip and `server_tokens off`
 - Performance tuning, which matches or beats a hand-tuned raw nginx:
   - Access log batched into 4 KB writes instead of one `write()` per request to the Docker log pipe. That alone was worth +70% req/s on small files.

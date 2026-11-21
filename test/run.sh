@@ -19,7 +19,7 @@ ok() { echo "ok $*"; }
 
 # ponytail: first ACME attempt can race pebble's startup; the module retries after ~1 min
 for i in $(seq 60); do
-  get site.example / >/dev/null 2>&1 && get files.example / >/dev/null 2>&1 && break
+  get site.example / >/dev/null 2>&1 && get files.example / >/dev/null 2>&1 && get mixed.example / >/dev/null 2>&1 && break
   sleep 2
 done
 r curl -svk --resolve site.example:443:127.0.0.1 https://site.example/ 2>&1 | grep -q 'issuer: CN=Pebble'; ok "acme cert"
@@ -63,11 +63,19 @@ r curl -skI --resolve php.test:443:127.0.0.1 https://php.test/wp-admin | grep -q
 [ "$(code php.test /.env)" = 404 ];                                            ok "php dotfiles hidden"
 app2=$(docker compose ps -q app2 | cut -c1-12)
 get paths.test /exact | grep -q "Hostname: $app2";                             ok "exact path route"
-get paths.test /exact/more | grep -vq "Hostname: $app2";                       ok "exact means exact"
+if get paths.test /exact/more | grep -q "Hostname: $app2"; then exit 1; fi;     ok "exact means exact"
 get paths.test /pre/x?q=1 | grep -q "GET /v1/pre/x?q=1";                       ok "prefix path route + upstream prefix"
 [ "$(code verify.test /dir)" = 502 ];                                          ok "https upstream verified (untrusted cert refused)"
 get insecure.test /dir | grep -q newNonce;                                        ok "https+insecure upstream"
 get site.example / -H 'X-Forwarded-For: 6.6.6.6' | grep -q 'X-Forwarded-For: 6.6.6.6' && exit 1; ok "client X-Forwarded-For replaced"
+get hosts.test / | grep -q '^Hostname:';                                       ok "upstream named only in /etc/hosts"
+get spaced.test /deep/link | grep -q 'spa index';                              ok "%-escaped root with a space"
+r curl -sf --cacert /var/cache/nginx/acme/local/ca.crt --resolve mixed.test:443:127.0.0.1 https://mixed.test/ | grep -q '^Hostname:'; ok "mixed entry: local name from the local CA"
+r curl -svk --resolve mixed.example:443:127.0.0.1 https://mixed.example/ 2>&1 | grep -q 'issuer: CN=Pebble'; ok "mixed entry: public name from ACME"
+if get local.test / -I | grep -qi 'strict-transport'; then exit 1; fi;          ok "no hsts on local names"
+[ "$(r stat -c '%U %a' /var/cache/nginx/acme)" = "root 755" ];                 ok "state volume is root's"
+[ "$(r stat -c '%U' /var/cache/nginx/acme/module)" = nginx ] && r test -f /var/cache/nginx/acme/module/account.key; ok "acme module state in module/"
+r grep -q 'Options KTLS' /etc/nginx/conf.d/sites.conf;                         ok "ktls with openssl 3"
 ws=$(r curl -sk --http1.1 --max-time 3 -o /dev/null -w '%{http_code}' --resolve site.example:443:127.0.0.1 \
   -H 'Connection: Upgrade' -H 'Upgrade: websocket' -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' https://site.example/echo || :)
 [ "$ws" = 101 ];                                                               ok "websocket upgrade"
@@ -79,6 +87,7 @@ sha() { sha256sum run/ngx/ngx.env | cut -d' ' -f1; }
 wait_status() { for i in $(seq 60); do grep -q "^$(sha) " run/ngx/ngx.status 2>/dev/null && break; sleep 1; done; cat run/ngx/ngx.status; }
 echo "SITES='new.test=app:80'" > run/ngx/ngx.env
 wait_status | grep -q ' ok$';                                                  ok "reload reported"
+grep -q '^features: .*pct' run/ngx/ngx.status;                                 ok "features announced"
 get new.test / | grep -q '^Hostname:';                                         ok "new site live"
 if get site.example / >/dev/null 2>&1; then exit 1; fi;                       ok "removed site gone"
 # fast: an atomic write is live in well under a second
@@ -96,6 +105,9 @@ echo "SITES='$s'" > run/ngx/ngx.env; wait_status >/dev/null; t0=$(date +%s)
 until [ "$(for i in 1 2 3 4 5 6 7 8; do get p$i.example / >/dev/null 2>&1 && echo y; done | grep -c y)" = 8 ]; do
   sleep 0.5; [ $(($(date +%s) - t0)) -lt 60 ] || break; done
 s=$(($(date +%s) - t0)); [ $s -lt 12 ];                                        ok "8 new certificates in ${s}s"
+echo "SITES='new.test=app:80 gone.test/x=app2:80'" > run/ngx/ngx.env
+st=$(wait_status)
+echo "$st" | head -1 | grep -q ' ok$' && echo "$st" | grep -q 'gone.test have no site entry'; ok "orphan path entry: warning, rest applied"
 echo "SITES='new.test=app:80 bad=entry=x'" > run/ngx/ngx.env
 wait_status | grep -q ' error: .*bad SITES entry';                             ok "bad config reported"
 get new.test / | grep -q '^Hostname:';                                         ok "previous config still served"
@@ -124,7 +136,7 @@ up;                                                                            o
 get new.test / | grep -q "Hostname: $app2";                                    ok "  ...serving the last config that worked"
 wait_status | grep -q ' error: .*bad SITES entry';                             ok "  ...and the error is reported"
 # no good config to fall back to either: nginx starts with no sites, and the next fix applies
-r rm -f /var/cache/nginx/acme/last-good.conf /etc/nginx/conf.d/sites.conf
+r rm -f /var/cache/nginx/acme/ngx/last-good.conf /etc/nginx/conf.d/sites.conf
 docker compose restart web >/dev/null 2>&1
 up;                                                                            ok "broken config, nothing to fall back to: nginx up"
 echo "SITES='new.test=app:80'" > run/ngx/ngx.env
